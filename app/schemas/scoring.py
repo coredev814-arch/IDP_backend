@@ -1,0 +1,167 @@
+"""Field-level confidence scoring — multi-stage validation pipeline.
+
+Each extracted field accumulates evidence from multiple stages:
+  Stage 1  Extraction: is the field populated? Does the value look valid?
+  Stage 2  Cross-document consistency: do multiple sources agree?
+  Stage 3  Business-rule validation: range, format, logical checks
+
+The composite score drives a green / yellow / red flag per field.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+class ScoreFlag(str, Enum):
+    GREEN = "green"      # high confidence — no review needed
+    NA = "na"            # field not applicable for this record type
+    YELLOW = "yellow"    # moderate — review recommended
+    RED = "red"          # low — likely wrong or missing, must review
+
+
+# Thresholds (composite score 0-1)
+GREEN_THRESHOLD = 0.80
+YELLOW_THRESHOLD = 0.50
+
+# Stage weights for LLM-only architecture
+WEIGHT_EXTRACTION = 0.20        # is the field populated?
+WEIGHT_SOURCE_VERIFY = 0.30     # is the value found in source text + OCR quality?
+WEIGHT_CROSS_DOC = 0.15         # do multiple documents agree?
+WEIGHT_BUSINESS_RULE = 0.35     # does the value pass format/range/logic checks?
+
+
+def compute_flag(composite: float) -> ScoreFlag:
+    if composite >= GREEN_THRESHOLD:
+        return ScoreFlag.GREEN
+    if composite >= YELLOW_THRESHOLD:
+        return ScoreFlag.YELLOW
+    return ScoreFlag.RED
+
+
+# ---------------------------------------------------------------------------
+# Per-field score
+# ---------------------------------------------------------------------------
+
+class StageScore(BaseModel):
+    """Score from one validation stage."""
+    stage: str                          # "extraction", "cross_doc", "business_rule"
+    score: float = Field(ge=0.0, le=1.0)
+    reason: Optional[str] = None        # human-readable explanation
+
+
+class FieldScore(BaseModel):
+    """Accumulated confidence for a single extracted field."""
+    field_name: str
+    value: Optional[str] = None         # the extracted value (for display)
+    stages: list[StageScore] = []
+    composite: float = Field(default=0.0, ge=0.0, le=1.0)
+    flag: ScoreFlag = ScoreFlag.RED
+    flag_message: Optional[str] = None  # summary for UI / findings
+
+    def mark_na(self, reason: str = "Not applicable for this income type") -> None:
+        """Mark field as N/A — excluded from scoring."""
+        self.stages = [StageScore(stage="na", score=1.0, reason=reason)]
+        self.composite = 1.0
+        self.flag = ScoreFlag.NA
+        self.flag_message = reason
+
+    def recompute(self) -> None:
+        """Recalculate composite from stage scores using weights."""
+        if any(s.stage == "na" for s in self.stages):
+            self.composite = 1.0
+            self.flag = ScoreFlag.NA
+            self.flag_message = next(
+                (s.reason for s in self.stages if s.stage == "na"), "N/A"
+            )
+            return
+
+        weight_map = {
+            "extraction": WEIGHT_EXTRACTION,
+            "source_verification": WEIGHT_SOURCE_VERIFY,
+            "cross_doc": WEIGHT_CROSS_DOC,
+            "business_rule": WEIGHT_BUSINESS_RULE,
+        }
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for s in self.stages:
+            w = weight_map.get(s.stage, 0.10)
+            weighted_sum += s.score * w
+            total_weight += w
+        self.composite = weighted_sum / total_weight if total_weight > 0 else 0.0
+        self.flag = compute_flag(self.composite)
+
+        # Auto-generate flag message from low-scoring stages
+        if self.flag == ScoreFlag.RED:
+            reasons = [s.reason for s in self.stages if s.score < YELLOW_THRESHOLD and s.reason]
+            self.flag_message = "; ".join(reasons) if reasons else "Low confidence — manual review required"
+        elif self.flag == ScoreFlag.YELLOW:
+            reasons = [s.reason for s in self.stages if s.score < GREEN_THRESHOLD and s.reason]
+            self.flag_message = "; ".join(reasons) if reasons else "Review recommended"
+        else:
+            self.flag_message = None
+
+
+# ---------------------------------------------------------------------------
+# Per-record (row) score card
+# ---------------------------------------------------------------------------
+
+class RecordScoreCard(BaseModel):
+    """Score card for one extracted record (e.g., one VerificationIncomeEntry)."""
+    record_type: str                    # "income", "asset", "household_member", "certification"
+    record_label: Optional[str] = None
+    fields: list[FieldScore] = []
+    composite: float = Field(default=0.0, ge=0.0, le=1.0)
+    flag: ScoreFlag = ScoreFlag.RED
+
+    def recompute(self) -> None:
+        """Recalculate record composite from field composites (excluding N/A)."""
+        scored = [f for f in self.fields if f.flag != ScoreFlag.NA]
+        if not scored:
+            self.composite = 1.0 if self.fields else 0.0
+            self.flag = ScoreFlag.GREEN if self.fields else ScoreFlag.RED
+            return
+        self.composite = sum(f.composite for f in scored) / len(scored)
+        self.flag = compute_flag(self.composite)
+
+    @property
+    def flagged_fields(self) -> list[FieldScore]:
+        return [f for f in self.fields if f.flag not in (ScoreFlag.GREEN, ScoreFlag.NA)]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-level score summary
+# ---------------------------------------------------------------------------
+
+class ExtractionScoreSummary(BaseModel):
+    """Top-level scoring summary for the entire extraction."""
+    records: list[RecordScoreCard] = []
+    overall_composite: float = Field(default=0.0, ge=0.0, le=1.0)
+    overall_flag: ScoreFlag = ScoreFlag.RED
+    total_fields: int = 0
+    green_fields: int = 0
+    yellow_fields: int = 0
+    red_fields: int = 0
+    na_fields: int = 0
+
+    def recompute(self) -> None:
+        """Recalculate from all records (N/A excluded from composite)."""
+        all_fields = [f for r in self.records for f in r.fields]
+        self.total_fields = len(all_fields)
+        self.green_fields = sum(1 for f in all_fields if f.flag == ScoreFlag.GREEN)
+        self.yellow_fields = sum(1 for f in all_fields if f.flag == ScoreFlag.YELLOW)
+        self.red_fields = sum(1 for f in all_fields if f.flag == ScoreFlag.RED)
+        self.na_fields = sum(1 for f in all_fields if f.flag == ScoreFlag.NA)
+        scored = [f for f in all_fields if f.flag != ScoreFlag.NA]
+        if scored:
+            self.overall_composite = sum(f.composite for f in scored) / len(scored)
+        else:
+            self.overall_composite = 1.0 if all_fields else 0.0
+        self.overall_flag = compute_flag(self.overall_composite)
