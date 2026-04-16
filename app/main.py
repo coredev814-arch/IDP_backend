@@ -29,9 +29,14 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["https://idp-frontend-nu.vercel.app/"],
+        allow_origins=[
+            "https://idp-frontend-nu.vercel.app",
+            "http://localhost:3000",
+        ],
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["*"],
     )
 
     register_exception_handlers(app)
