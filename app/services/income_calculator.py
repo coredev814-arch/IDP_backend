@@ -226,19 +226,36 @@ def calculate_all_methods(
         income_type = (vi_entry.incomeType or "").lower()
         calc_mode = _classify_income_mode(income_type)
 
-        # Method 1: Self-declared (annualized by frequencyOfPay)
-        sd = calculate_self_declared(
-            vi_entry.selfDeclaredAmount,
-            vi_entry.frequencyOfPay,
-        )
-        if sd:
-            results.append(IncomeCalculationResult(
-                memberName=member_name,
-                sourceName=source_name,
-                method="self-declared",
-                annualIncome=sd,
-                details=f"Self-declared amount: {sd}",
-            ))
+        # Method 1: Self-declared — routed by calc_mode.
+        # For fixed_monthly types (SSA, pension, child support) the
+        # selfDeclaredAmount is typically the ANNUAL total from a benefit
+        # letter or TIC column, not a monthly figure. frequencyOfPay
+        # describes when the person is PAID, not the amount's time basis.
+        # Blindly ×12 here double-annualizes (e.g. $16,976/yr × 12 = $203,716).
+        sd_amount = vi_entry.selfDeclaredAmount
+        if sd_amount:
+            try:
+                sd_val = float(sd_amount)
+                if calc_mode in ("fixed_monthly", "annual_net"):
+                    # Already annual — use as-is
+                    sd_str = f"{sd_val:.2f}"
+                    sd_details = f"Self-declared annual: {sd_str}"
+                else:
+                    # Employment — annualize by frequencyOfPay
+                    sd_str = calculate_self_declared(
+                        sd_amount, vi_entry.frequencyOfPay,
+                    )
+                    sd_details = f"Self-declared amount: {sd_str}"
+                if sd_str:
+                    results.append(IncomeCalculationResult(
+                        memberName=member_name,
+                        sourceName=source_name,
+                        method="self-declared",
+                        annualIncome=sd_str,
+                        details=sd_details,
+                    ))
+            except ValueError:
+                pass
 
         # Method 2: VOI-based — route by income mode
         if calc_mode == "fixed_monthly" and vi_entry.rateOfPay:

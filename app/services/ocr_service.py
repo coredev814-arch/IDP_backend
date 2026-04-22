@@ -11,43 +11,100 @@ from app.core.exceptions import ProcessingError
 logger = logging.getLogger(__name__)
 
 
-def ocr_single_image(image_path: Path, settings: Settings) -> dict:                                                                                                                                          
-    """Send a single processed image to the OCR service and return result with flags."""                                                                                                                     
-    img = Image.open(image_path)                                                                                                                                                                             
-                                                                                                                                                                                                            
-    buf = io.BytesIO()                                                                                                                                                                                       
-    img.save(buf, format="PNG")                                                                                                                                                                              
-    buf.seek(0)                                                                                                                                                                                              
+def _call_deepseek_ocr(buf: io.BytesIO, image_name: str, settings: Settings) -> dict:
+    """Tier 1: DeepSeek-OCR."""
+    buf.seek(0)
+    with httpx.Client(timeout=settings.ocr_timeout) as client:
+        response = client.post(
+            settings.ocr_service_url,
+            files={"file": (image_name, buf, "image/png")},
+            data={
+                "prompt": settings.ocr_prompt,
+                "dpi": str(settings.ocr_dpi),
+                "raw": bool(settings.ocr_raw),
+                "retry": bool(settings.ocr_retry),
+            },
+        )
+        response.raise_for_status()
+    return response.json()
 
-    try:                                                                                                                                                                                                     
-        with httpx.Client(timeout=settings.ocr_timeout) as client:                                                                                                                                           
-            response = client.post(                                                                                                                                                                          
-                settings.ocr_service_url,                                                                                                                                                                    
-                files={"file": (image_path.name, buf, "image/png")},                                                                                                                                         
-                data={                                                                                                                                                                                     
-                    "prompt": settings.ocr_prompt,
-                    "dpi": str(settings.ocr_dpi),
-                    "raw": bool(settings.ocr_raw),                                                                                                                                                           
-                    "retry": bool(settings.ocr_retry),
-                },                                                                                                                                                                                           
-            )                                                                                                                                                                                              
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise ProcessingError(f"OCR service timed out for {image_path.name}") from exc                                                                                                                       
-    except httpx.HTTPStatusError as exc:
-        raise ProcessingError(                                                                                                                                                                               
-            f"OCR service returned {exc.response.status_code} for {image_path.name}: "                                                                                                                     
-            f"{exc.response.text}"                                                                                                                                                                           
-        ) from exc
-    except httpx.RequestError as exc:
-        raise ProcessingError(f"OCR service unreachable: {exc}") from exc
+
+def _call_glm_ocr(buf: io.BytesIO, image_name: str, settings: Settings) -> dict:
+    """Tier 2: GLM-OCR fallback."""
+    buf.seek(0)
+    with httpx.Client(timeout=settings.ocr_timeout) as client:
+        response = client.post(
+            settings.ocr_fallback_url,
+            files={"files": (image_name, buf, "image/png")},
+        )
+        response.raise_for_status()
 
     result = response.json()
 
-    # When DeepSeek fails entirely, the OCR service sets needs_external_ocr.
-    # Surface this as an ocr_failed flag so the classifier's existing
-    # ocr_failed handling kicks in (pages are sent to the LLM with the flag
-    # as metadata instead of being silently dropped).
+    text = result.get("text", "")
+    if not text and isinstance(result.get("results"), list):
+        text = "\n".join(r.get("text", "") for r in result["results"])
+
+    return {
+        "text": text,
+        "flag": "yellow",
+        "flag_message": "Extracted via GLM-OCR fallback",
+        "flag_details": ["glm_ocr_fallback"],
+        "score": {"composite": 0.6},
+        "needs_external_ocr": False,
+    }
+
+
+def ocr_single_image(image_path: Path, settings: Settings) -> dict:
+    """Send a single processed image to OCR with tiered fallback.
+
+    Tier 1: DeepSeek-OCR (primary)
+    Tier 2: GLM-OCR (if DeepSeek fails or needs_external_ocr)
+    Tier 3: Vision LLM (handled by pdf_service Phase B2)
+    """
+    img = Image.open(image_path)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    # Tier 1: DeepSeek-OCR
+    try:
+        result = _call_deepseek_ocr(buf, image_path.name, settings)
+    except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+        logger.warning(
+            "DeepSeek-OCR failed for %s (%s) — trying GLM-OCR fallback",
+            image_path.name, type(exc).__name__,
+        )
+        result = None
+
+    needs_fallback = (
+        result is None
+        or result.get("needs_external_ocr")
+    )
+
+    # Tier 2: GLM-OCR fallback
+    if needs_fallback and settings.ocr_fallback_url:
+        try:
+            glm_result = _call_glm_ocr(buf, image_path.name, settings)
+            if glm_result.get("text", "").strip():
+                logger.info(
+                    "GLM-OCR fallback succeeded for %s — %d chars",
+                    image_path.name, len(glm_result["text"]),
+                )
+                return glm_result
+            logger.warning(
+                "GLM-OCR returned empty text for %s — marking for vision fallback",
+                image_path.name,
+            )
+        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning(
+                "GLM-OCR fallback also failed for %s (%s) — marking for vision fallback",
+                image_path.name, type(exc).__name__,
+            )
+
+    if result is None:
+        raise ProcessingError(f"All OCR services failed for {image_path.name}")
+
     if result.get("needs_external_ocr"):
         flags = result.setdefault("flag_details", [])
         if isinstance(flags, list) and "ocr_failed" not in flags:

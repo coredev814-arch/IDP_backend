@@ -112,6 +112,20 @@ CRITICAL RULES:
   utilityAllowance, unitNumber, and signatureDate even if the cert form itself is missing
   those fields. The lease uses plain-English numbered paragraphs, not form field codes.
 
+ANTI-HALLUCINATION GUARD (CRITICAL):
+- If a numeric field is BLANK on the form — empty line, "$" with no number,
+  "$0" / "$0.00" / "0.00", dashes, "N/A", or literally nothing next to the
+  label — return null for that field. Do NOT invent a plausible value.
+- Every extracted value must be a literal string that appears in the document
+  text. Before outputting a number, verify the exact digits are present.
+- If income shows $0 across ALL sources (TIC Part III totals = $0, HUD 50059
+  field 86 = $0, RD 3560-8 Line 18.f = $0), then householdIncome = "0.00"
+  (not null, not a guess). Zero-income households are legitimate.
+- For rent fields: if the primary form is blank, check secondary forms per
+  the MULTI-SOURCE FALLBACK rules. If ALL are blank, return null.
+- NEVER map unrelated numbers (e.g., security deposit, utility schedule,
+  passbook rate, field numbers like "30" or "31") to rent fields.
+
 FIELDS TO EXTRACT:
 - certificationType: Certification type code. Values: "MI" (Move-In/Initial), "AR" (Annual Recertification), "AR-SC" (Annual Recert Self-Certification), "IR" (Interim Recertification). Look for: "Type of Certification" field, checkboxes for Initial/Annual/Interim, or coded fields on the form.
 - effectiveDate: Effective date of the certification. YYYY-MM-DD format.
@@ -129,9 +143,23 @@ FIELDS TO EXTRACT:
 
 DOCUMENT-SPECIFIC GUIDANCE:
 - TIC Form: Cert type is in the header area (checkboxes for Initial/Annual/Interim/Other). Effective date is labeled "Effective Date". Income is in Part III "Income". Rent fields are in Part IV "Rent".
-- HUD 50059: Cert type is field 2b "Type of Action" (1=Initial, 2=Annual, 3=Interim, etc.). Effective date is field 2a. Income is in Section 6. Rent fields are in Section 7.
-- HUD 3560: USDA equivalent — look for similar fields in the form structure.
-- HUD Model Lease: Contract Rent = grossRent. "Tenant Rent" / tenant's portion = tenantRent. "Utility Allowance" = utilityAllowance. "Unit" / dwelling unit number = unitNumber. Lease commencement date = effectiveDate. Signature date on the lease = signatureDate.
+- HUD 50059: Cert type is field 2b "Type of Action" (1=Initial, 2=Annual, 3=Interim, etc.). Effective date is field 2a. Field 29 = Contract Rent, Field 30 = Utility Allowance, Field 31 = Gross Rent (this is the true grossRent, NOT field 29). Field 110 = Tenant Rent. Field 86 = Total Annual Income.
+- HUD 3560 (RD 3560-8 / USDA): Line 30.a = Note Rate Rent (use as tenantRent or grossRent depending on form), Line 30.b = Utility Allowance, Line 30.c = Gross Note Rate Rent (use as grossRent). Line 33 = Final NTC (Net Tenant Contribution = tenantRent). Line 18.f = Monthly Income, Line 20 = Adjusted Annual Income.
+- HUD Model Lease: Gross Rent = Contract Rent + Utility Allowance. Record grossRent from the "Gross Rent" line if shown, otherwise compute Contract Rent + UA. "Tenant Rent" / tenant's portion = tenantRent. "Utility Allowance" = utilityAllowance. "Unit" / dwelling unit number = unitNumber. Lease commencement date = effectiveDate. Signature date on the lease = signatureDate.
+
+MULTI-SOURCE FALLBACK (CRITICAL):
+When the primary certification form (TIC / HUD 50059 / HUD 3560) has a BLANK
+field, look for the same data on a secondary form within the same group:
+  1. TIC rent fields blank → check RD 3560-8 Line 30.a/b/c (on same cert)
+  2. TIC income blank → check household income on RD 3560-8 Line 18.f × 12 or Line 20
+  3. HUD 50059 fields missing → check attached HUD Model Lease / Notice of Rent Change
+  4. Any primary form missing effectiveDate → fall back to:
+     - TIC Part X "Date Signed" or Part VII "Move-in Date"
+     - HUD 50059 owner signature date
+     - HUD Model Lease commencement date
+     - Notice of Rent Change "effective with the rent due for"
+NEVER invent a rent figure that is not present somewhere in the document text.
+If all sources are blank, return null for that field.
 
 Return ONLY valid JSON: {"certificationInfo": {...}}"""
 
@@ -148,6 +176,21 @@ CRITICAL RULES:
 DOCUMENT ROUTING:
 - payStub route: Pay stubs, pay-slips, Work Number/Equifax/ScreeningWorks/Vault Verify wage records
 - verificationIncome route: SSA/EIV benefit letters, TANF, child support, cash contributions, pension, self-employment, sworn statements, VOI/VOE
+
+CHILD SUPPORT STATEMENT — ALWAYS EXTRACT:
+Any "Child Support Statement", "Child Support Order", "Child Support Verification",
+court order with ordered amounts, or DOR/State Disbursement Unit statement → create
+a verificationIncome entry:
+  - sourceName: payer name, or "Child Support" / state agency name if payer unknown
+  - memberName: the custodial parent/head of household receiving support
+  - incomeType: "Child Support"
+  - type_of_VOI: "Child Support Order"
+  - selfDeclaredAmount: monthly or annual support amount as shown
+  - rateOfPay: support amount per payment period, if shown
+  - frequencyOfPay: payment frequency (weekly, bi-weekly, monthly), if shown
+Do NOT skip child support just because the form is brief or lacks typical wage fields.
+If a TIC or cert form lists household income that exceeds the sum of wage sources, and
+a Child Support Statement is present, the gap is almost always the child support amount.
 
 PAYSTUB FIELDS:
 - sourceName: employer name, Title Case
@@ -468,17 +511,37 @@ document (e.g., the form line is blank), return null for that key — but try
 hard first: the field is almost certainly in the text somewhere.
 
 Field meanings:
-- effectiveDate: Effective date of this certification (YYYY-MM-DD)
-- grossRent: Gross rent amount (numeric, 2 decimals, no $ or commas)
-- tenantRent: Tenant's portion of rent (numeric)
-- utilityAllowance: Utility allowance amount (numeric)
-- householdIncome: Total annual household income (numeric)
-- unitNumber: Unit number or apartment number
+- effectiveDate: Effective date of this certification (YYYY-MM-DD). Check, in order:
+  (1) TIC/HUD 50059/RD 3560 "Effective Date" field,
+  (2) TIC Part X "Date Signed" or Part VII "Move-in Date",
+  (3) HUD 50059 owner signature date,
+  (4) HUD Model Lease commencement date,
+  (5) Notice of Rent Change / Lease Amendment "effective with the rent due for [date]".
+- grossRent: Gross rent amount (numeric, 2 decimals, no $ or commas). For HUD
+  50059 this is FIELD 31, NOT field 29. For RD 3560-8 this is Line 30.c.
+  If blank on the primary form, check RD 3560-8 / Model Lease / Notice of Rent Change.
+- tenantRent: Tenant's portion of rent (numeric). HUD 50059 field 110, TIC Part IV
+  "Tenant Rent", RD 3560-8 Line 33 (Final NTC). If blank, check lease or notice.
+- utilityAllowance: Utility allowance amount (numeric). HUD 50059 field 30, RD 3560-8
+  Line 30.b, TIC Part IV "Utility Allowance".
+- householdIncome: Total annual household income (numeric). HUD 50059 field 86, TIC
+  Part III "Total Income (E)", RD 3560-8 Line 18.f × 12 or Line 20.
+- unitNumber: Unit number or apartment number. Strip any building prefix
+  (e.g., "Bldg 2 Unit 27" → "27", "2 27" → "27").
 - householdSize: Number of household members (integer as string)
 - numberOfBedrooms: Number of bedrooms (numeric string)
 
 Return ONLY valid JSON: {"field_name": value, ...}
-Do NOT include fields not in the missing list."""
+Do NOT include fields not in the missing list.
+
+ANTI-HALLUCINATION GUARD (CRITICAL):
+- Every extracted number must be literal text in the document. If the field
+  is blank (empty, "$" with no number, "$0", "N/A"), return null.
+- Do NOT invent plausible values. Better to return null than to guess.
+- Do NOT map field numbers ("30", "31", "86"), line numbers, percentages,
+  or unrelated figures (security deposit, passbook rate) to rent fields.
+- For zero-income households where all income sources show $0, return
+  "0.00" for householdIncome — not a guess, not null."""
 
 
 def _retry_cert_info_fields(

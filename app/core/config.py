@@ -42,9 +42,10 @@ class Settings(BaseSettings):
 
     # OCR service
     ocr_service_url: str = ""
+    ocr_fallback_url: str = ""
     ocr_prompt: str = "document"
     ocr_dpi: int = 200
-    ocr_timeout: int = 120
+    ocr_timeout: int = 600
     ocr_raw: bool = False
     ocr_retry: bool = True
     # OCR service can handle 4 concurrent requests. Parallelizing OCR

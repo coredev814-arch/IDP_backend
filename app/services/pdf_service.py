@@ -94,7 +94,20 @@ def process_pdf(pdf_bytes: bytes, settings: Settings) -> dict:
     # ocr_single_image only does I/O (HTTP POST).
     def _ocr_one(item: tuple[int, Path]) -> tuple[int, dict]:
         page_num, path = item
-        result = ocr_single_image(path, settings)
+        try:
+            result = ocr_single_image(path, settings)
+        except ProcessingError:
+            logger.warning(
+                "OCR failed page=%d — will attempt vision fallback", page_num,
+            )
+            result = {
+                "text": "",
+                "flag": "red",
+                "flag_message": "OCR service failed (timeout or error)",
+                "flag_details": ["ocr_failed"],
+                "score": {"composite": 0.0},
+                "needs_external_ocr": True,
+            }
         score = result.get("score", {})
         composite = score.get("composite") if isinstance(score, dict) else score
         logger.info(
@@ -119,18 +132,7 @@ def process_pdf(pdf_bytes: bytes, settings: Settings) -> dict:
     # classification and extraction so every downstream step benefits.
     low_quality_pages = []
     for page_num, ocr_result in ocr_results.items():
-        score = ocr_result.get("score", {})
-        composite = score.get("composite") if isinstance(score, dict) else (
-            float(score) if isinstance(score, (int, float)) else None
-        )
-        needs_external = ocr_result.get("needs_external_ocr", False)
-        text = ocr_result.get("text", "")
-
-        if needs_external or (composite is not None and composite < settings.ocr_vision_threshold):
-            low_quality_pages.append(page_num)
-        elif len(text.strip()) < 50 and text.strip():
-            # Near-empty text on a non-blank page — OCR likely failed
-            # even if the score doesn't reflect it.
+        if ocr_result.get("needs_external_ocr"):
             low_quality_pages.append(page_num)
 
     if low_quality_pages:

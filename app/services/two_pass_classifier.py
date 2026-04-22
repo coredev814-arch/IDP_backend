@@ -207,6 +207,15 @@ CRITICAL CLASSIFICATION RULES:
   Do NOT label RD 3560-8 as "Income Calculation Worksheet" just because it
   contains a "Part IV - Income Calculations" heading.
 
+- RD 3560-8 BACK PAGE: The second page of an RD 3560-8 continues Parts VII-X
+  with sections like "PART VII - PRELIMINARY CALCULATIONS", "PART VIII
+  DETERMINING GROSS TENANT CONTRIBUTION (GTC)", "PART IX - DETERMINING NET
+  TENANT CONTRIBUTION (NTC)", "PART X - CERTIFICATION BY BORROWER",
+  "Gross Note Rate Rent", "Note Rate Rent", "Utility Allowance" as line
+  items (30.a / 30.b / 30.c). Classify as "HUD 3560 Form", INCLUDE — do NOT
+  misclassify as "Income Calculation Worksheet" or "TIC" just because the
+  Part I header is absent on the back page.
+
 - "Income Calculation Worksheet" means a SEPARATE internal spreadsheet or
   calc tape used by property staff — NOT any cert form that contains an
   income calculation section.
