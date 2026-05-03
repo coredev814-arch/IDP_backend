@@ -82,15 +82,78 @@ def _close(a: float, b: float, tolerance: float = 0.05) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Synonym tables — map AI extraction names to MuleSoft's abbreviations.
+# Both sides get normalized to a canonical form before comparison.
+# Maps to either an explicit canonical or a longer matching string.
+# ---------------------------------------------------------------------------
+
+_INCOME_SOURCE_SYNONYMS: dict[str, str] = {
+    # Social Security family
+    "ssa": "social security administration",
+    "ss": "social security administration",
+    "social security": "social security administration",
+    "social security administration": "social security administration",
+    # SSI
+    "ssi": "supplemental security income",
+    "supplemental security income": "supplemental security income",
+    # SSDI
+    "ssdi": "social security disability",
+    "social security disability": "social security disability",
+    # State supplements (varies by state — group together)
+    "ssp": "state supplement program",
+    "state supplement program": "state supplement program",
+    "massachusetts state supplement program": "state supplement program",
+    "ma ssp": "state supplement program",
+    "ma state supplement": "state supplement program",
+    # Public assistance
+    "tanf": "temporary assistance",
+    "temporary assistance": "temporary assistance",
+    "calworks": "temporary assistance",
+    "colorado works program": "temporary assistance",
+    "colorado works": "temporary assistance",
+    "afdc": "temporary assistance",
+    # Anticipated income — MuleSoft sometimes uses this as a generic
+    # bucket; treat as "self-declared" so it can match AI's TIC extraction.
+    "anticipated income": "self-declared",
+    "self-declared": "self-declared",
+    "self declared": "self-declared",
+}
+
+
+def _normalize_income_source(name: str | None) -> str:
+    """Map an income source name to its canonical form for comparison."""
+    raw = _norm(name)
+    if not raw:
+        return ""
+    if raw in _INCOME_SOURCE_SYNONYMS:
+        return _INCOME_SOURCE_SYNONYMS[raw]
+    # Substring fallback — handle "Massachusetts SSP", "MA SSI", etc.
+    for synonym, canonical in _INCOME_SOURCE_SYNONYMS.items():
+        if synonym in raw or raw in synonym:
+            return canonical
+    return raw
+
+
+# ---------------------------------------------------------------------------
 # Member comparison
 # ---------------------------------------------------------------------------
 
 def _member_key(rec: dict) -> tuple[str, str]:
-    """Identity key: (DOB, last 4 of SSN). Stable across systems."""
+    """Strict identity key: (DOB, last 4 of SSN)."""
+    dob = rec.get("DOB") or rec.get("DOB__c") or ""
+    # Salesforce sometimes returns dates as ISO datetime strings; normalize to date-only.
+    dob_str = str(dob)[:10] if dob else ""
     return (
-        str(rec.get("DOB") or rec.get("DOB__c") or ""),
+        dob_str,
         _ssn_last4(rec.get("socialSecurityNumber") or rec.get("SSN__c")),
     )
+
+
+def _member_name_key(rec: dict) -> str:
+    """Fallback key based on name — used when DOB/SSN are partial."""
+    first = (rec.get("FirstName") or rec.get("First_Name__c") or "").strip().lower()
+    last = (rec.get("LastName") or rec.get("Last_Name__c") or "").strip().lower()
+    return f"{first} {last}".strip()
 
 
 def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[list[Finding], dict]:
@@ -116,8 +179,37 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
     sf_keys_set = {k for k in sf_keys if k != ("", "")}
 
     matched = ai_keys.keys() & sf_keys_set
-    ai_only = ai_keys.keys() - sf_keys_set
-    sf_only = sf_keys_set - ai_keys.keys()
+    ai_only_keys = ai_keys.keys() - sf_keys_set
+    sf_only_keys = sf_keys_set - ai_keys.keys()
+
+    # Name-based fallback match: if a member is "missing" in one system
+    # but a same-named member exists in the other, treat as matched (with
+    # a flag — not as both directions of missing).
+    ai_only_by_name = {
+        _member_name_key(ai_keys[k]): k for k in ai_only_keys
+    }
+    sf_only_by_name = {
+        _member_name_key(sf_keys[k][0]): k for k in sf_only_keys
+    }
+    name_matches = set(ai_only_by_name) & set(sf_only_by_name)
+    name_matches.discard("")  # ignore empty names
+
+    fallback_matched_ai_keys = {ai_only_by_name[n] for n in name_matches}
+    fallback_matched_sf_keys = {sf_only_by_name[n] for n in name_matches}
+
+    ai_only = ai_only_keys - fallback_matched_ai_keys
+    sf_only = sf_only_keys - fallback_matched_sf_keys
+
+    # Surface the fuzzy matches as a different (lower-severity) finding
+    for name in name_matches:
+        findings.append(Finding(
+            category=VALUE_MISMATCH,
+            severity="low",
+            message=(
+                f"Member identity mismatch — '{name.title()}' exists in both systems "
+                f"but DOB/SSN keys differ (likely OCR/data entry difference)"
+            ),
+        ))
 
     for k in ai_only:
         m = ai_keys[k]
@@ -174,11 +266,19 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
 # ---------------------------------------------------------------------------
 
 def _income_key(rec: dict) -> tuple[str, str]:
-    """Source name + member name (normalized)."""
-    return (
-        _norm(rec.get("sourceName") or rec.get("Source_Name__c")),
-        _norm(rec.get("memberName") or rec.get("House_Member_Name__c")),
-    )
+    """Source name (normalized through synonym table) + member name.
+
+    AI extracts full names ('social security administration'), MuleSoft
+    often uses abbreviations ('ssa'). Both go through the same synonym
+    map so they match correctly.
+    """
+    source = rec.get("sourceName") or rec.get("Source_Name__c")
+    member = rec.get("memberName") or rec.get("House_Member_Name__c") or ""
+    # Normalize member: trim middle initial / 'r.' / 'jr' suffixes for fuzzy match.
+    member_clean = _norm(member).replace(".", "").strip()
+    member_tokens = [t for t in member_clean.split() if len(t) > 1]
+    member_key = " ".join(member_tokens) if member_tokens else member_clean
+    return (_normalize_income_source(source), member_key)
 
 
 def _compare_income(
@@ -290,8 +390,28 @@ def _compare_assets(
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
 
-    sf_keys: dict[tuple, list[dict]] = {}
+    # Filter out SF asset records with no identifying fields — they're
+    # placeholder rows MuleSoft sometimes creates that we can't compare
+    # meaningfully. (Examples: real-estate stubs with no source/account.)
+    sf_assets_filtered: list[dict] = []
+    sf_orphan_count = 0
     for a in sf_assets:
+        has_source = bool((a.get("Source_Name__c") or "").strip())
+        has_account = bool((a.get("accountNumber") or "").strip())
+        has_balance = _money(a.get("Cash_Value__c") or a.get("VOA_Current__c"))
+        if not has_source and not has_account and not has_balance:
+            sf_orphan_count += 1
+            continue
+        sf_assets_filtered.append(a)
+
+    if sf_orphan_count > 0:
+        logger.debug(
+            "Filtered %d MuleSoft asset record(s) with no identifying fields",
+            sf_orphan_count,
+        )
+
+    sf_keys: dict[tuple, list[dict]] = {}
+    for a in sf_assets_filtered:
         k = _asset_key(a)
         sf_keys.setdefault(k, []).append(a)
 
