@@ -42,7 +42,27 @@ def format_findings(
     ]
 
     if not comparison.findings:
-        lines.append("FINDINGS: none — extraction matches MuleSoft data.")
+        # Distinguish "extraction succeeded with full agreement" from
+        # "extraction produced nothing meaningful". The latter is common
+        # for stub PDFs, single-page rejections, or unrecognized docs.
+        c = comparison.confidence
+        produced_anything = (
+            c.agreements > 0 or c.disagreements > 0
+            or c.ai_only_records > 0 or c.sf_only_records > 0
+        )
+        if not produced_anything and c.extraction_score < 0.5:
+            lines.append(
+                "FINDINGS: extraction did not produce data for comparison "
+                "(low extraction quality or unrecognized document). "
+                "Manual review required."
+            )
+        elif not produced_anything:
+            lines.append(
+                "FINDINGS: no comparable records in either system. "
+                "Manual review may be required."
+            )
+        else:
+            lines.append("FINDINGS: none — extraction matches MuleSoft data.")
         return "\n".join(lines)
 
     sorted_findings = sorted(

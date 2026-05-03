@@ -102,6 +102,27 @@ def process_case(case_record: dict, settings: Settings) -> None:
     cert_type = case_record.get("CertType__c")
     funding = case_record.get("Funding_Program2__c")
 
+    # Cases without a CertType__c are usually stubs or non-cert work items
+    # that shouldn't be audited. Mark as failed so we don't keep retrying.
+    if not cert_type:
+        logger.warning(
+            "Skipping case=%s — CertType__c is missing on the Case record. "
+            "Polling SOQL should typically exclude these; flagging as failed.",
+            case_number or case_id,
+        )
+        store = get_job_store(settings.audit_job_db)
+        store.upsert_pending(
+            case_id=case_id,
+            case_number=case_number,
+            cert_type=None,
+            funding_program=None,
+            content_document_id=None,
+        )
+        store.mark_extraction_failed(
+            case_id, "CertType__c missing — case not eligible for audit",
+        )
+        return
+
     logger.info(
         "Polling: processing case=%s cert=%s funding=%s",
         case_number, cert_type, funding,

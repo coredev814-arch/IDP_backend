@@ -170,6 +170,31 @@ def _normalize_org_name(name: str | None) -> str:
     return " ".join(tokens) if tokens else raw
 
 
+def _name_similarity(a: str, b: str) -> float:
+    """Best-of full-string and per-token similarity.
+
+    Full-string ratio handles "Walt Disney Company" vs "The Walt Disney
+    Company" cleanly. But OCR errors like "chilts" vs "chilis bar & grill"
+    fail the full-string check (extra tokens drag the ratio down). Per-
+    token best-pair similarity catches those.
+    """
+    if not a or not b:
+        return 0.0
+    full_ratio = SequenceMatcher(None, a, b).ratio()
+
+    # Per-token best pair: split both, find the best matching pair.
+    a_tokens = [t for t in a.split() if len(t) > 2]
+    b_tokens = [t for t in b.split() if len(t) > 2]
+    best_token = 0.0
+    for ta in a_tokens:
+        for tb in b_tokens:
+            r = SequenceMatcher(None, ta, tb).ratio()
+            if r > best_token:
+                best_token = r
+
+    return max(full_ratio, best_token)
+
+
 # ---------------------------------------------------------------------------
 # Member comparison
 # ---------------------------------------------------------------------------
@@ -243,15 +268,16 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
         for sf_name, sf_k in sf_only_with_names:
             if not sf_name or sf_k in fallback_matched_sf_keys:
                 continue
-            # SequenceMatcher.ratio: 1.0 = identical, 0.0 = nothing in common.
-            # 0.85 catches single-letter typos ("Yvet" / "Yvett" → 0.95)
-            # without false-matching distinct names ("Smith" / "Smyth" → 0.80).
-            ratio = SequenceMatcher(None, ai_name, sf_name).ratio()
+            # 0.82 threshold catches single-letter OCR variants like
+            # "Latisha" / "Latticia" (ratio 0.83) and "Yvet" / "Yvett"
+            # (ratio 0.95). Tighter would miss those; looser risks
+            # false-matching distinct names.
+            ratio = _name_similarity(ai_name, sf_name)
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_sf_key = sf_k
                 best_sf_name = sf_name
-        if best_ratio >= 0.85 and best_sf_key is not None:
+        if best_ratio >= 0.82 and best_sf_key is not None:
             fallback_matched_ai_keys.add(ai_k)
             fallback_matched_sf_keys.add(best_sf_key)
             fuzzy_match_pairs.append((ai_name, best_sf_name))
@@ -409,10 +435,11 @@ def _compare_income(
                 if member_ratio < 0.7:
                     continue
             sf_normalized = _normalize_org_name(sf_k[0])
-            # Strip corporate suffixes/prefixes BEFORE comparing — catches
-            # "Coherent Corp" ↔ "Coherent", "The Walt Disney Company" ↔
-            # "Walt Disney Company", etc.
-            source_ratio = SequenceMatcher(None, ai_normalized, sf_normalized).ratio()
+            # Strip corporate suffixes/prefixes AND check per-token
+            # similarity — catches "Coherent Corp" ↔ "Coherent",
+            # "The Walt Disney Company" ↔ "Walt Disney Company",
+            # AND "chilts" ↔ "chilis bar & grill" (per-token: chilts/chilis).
+            source_ratio = _name_similarity(ai_normalized, sf_normalized)
             if source_ratio > best_ratio:
                 best_ratio = source_ratio
                 best_sf_k = sf_k
@@ -581,10 +608,13 @@ def _compare_assets(
                 sf_rec.get("Cash_Value__c") or sf_rec.get("VOA_Current__c")
             )
 
-            # Score = combination of name similarity and balance match
+            # Score = combination of name similarity and balance match.
+            # Use _name_similarity (full-string + per-token) to catch
+            # "Knights of Columbus" ↔ "4633 KOC" via balance, and
+            # "Walt Disney" ↔ "The Walt Disney Company" via tokens.
             name_score = 0.0
             if ai_src_norm and sf_src_norm:
-                name_score = SequenceMatcher(None, ai_src_norm, sf_src_norm).ratio()
+                name_score = _name_similarity(ai_src_norm, sf_src_norm)
             balance_match = (
                 ai_bal is not None and sf_bal is not None
                 and _close(ai_bal, sf_bal, tolerance=0.02)
