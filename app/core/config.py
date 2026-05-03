@@ -75,3 +75,47 @@ class Settings(BaseSettings):
         "application/pdf",
         "application/octet-stream",
     ]
+
+    # ------------------------------------------------------------------
+    # Salesforce integration
+    # ------------------------------------------------------------------
+    sf_username: str = ""
+    sf_password: str = ""
+    sf_token: str = ""
+    sf_domain: str = "us-hc.my"
+
+    # Webhook authentication — Salesforce includes this token in the
+    # Authorization header. Reject any webhook without a matching token.
+    webhook_auth_token: str = ""
+    # Set IDP_DEV_MODE=true ONLY for local development to bypass webhook
+    # auth. In production this MUST be false (the default) so missing
+    # tokens fail closed instead of accepting unauthenticated webhooks.
+    dev_mode: bool = False
+
+    # Salesforce HTTP timeout (seconds) for both SOQL queries and binary
+    # downloads. A hung Salesforce response would otherwise block the
+    # worker indefinitely.
+    sf_request_timeout: int = 30
+
+    # Integration mode:
+    #   "webhook" — Salesforce pushes signals via /webhook/pdf-attached and
+    #               /webhook/mulesoft-done. Default. Lower latency, requires
+    #               Salesforce-side Apex triggers + named credentials.
+    #   "poll"    — IDP polls Salesforce on a fixed interval to find ready
+    #               cases. No Salesforce-side setup required. Higher latency
+    #               and SF API load. Webhooks return 503 in this mode.
+    #   "both"    — Both webhook and poller active. Useful during transition.
+    audit_mode: str = "webhook"
+
+    # Poller settings (only used when audit_mode in {"poll", "both"})
+    audit_poll_interval_seconds: int = 60
+    audit_poll_batch_size: int = 5
+
+    # Audit job storage (SQLite). Persists case state across restarts.
+    audit_job_db: Path = Path("output/audit_jobs.db")
+
+    # When MuleSoft webhook arrives but IDP extraction is still running,
+    # the comparison job polls every N seconds until extraction completes
+    # or the timeout fires.
+    audit_extraction_wait_seconds: int = 600    # 10 minutes
+    audit_extraction_poll_seconds: int = 15

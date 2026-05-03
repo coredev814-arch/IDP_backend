@@ -448,6 +448,18 @@ _FIXED_INCOME_NA_FIELDS = {
     "ytdAmount", "ytdStartDate", "ytdEndDate",
 }
 
+# AR-SC certifications use the TIC as the source of truth — there are NO
+# third-party verification documents (VOI, paystubs, Equifax). Every
+# wage-verification field is EXPECTED to be null. Suppress them as N/A
+# instead of penalizing as RED.
+_AR_SC_NA_FIELDS = {
+    "rateOfPay", "frequencyOfPay", "hoursPerPayPeriod",
+    "overtimeRate", "overtimeFrequency",
+    "ytdAmount", "ytdStartDate", "ytdEndDate",
+    "employmentStatus", "terminationDate", "hireDate",
+    "type_of_VOI", "dateReceived",
+}
+
 
 def score_business_rules(
     cards: list[RecordScoreCard],
@@ -477,6 +489,13 @@ def _score_income_rules(card: RecordScoreCard, cert_type: str | None) -> None:
         ):
             update_field_score(card, field_name, stage="business_rule",
                                score=1.0, reason="Valid name")
+
+    # AR-SC: TIC is the source of truth, no VOI/paystubs expected.
+    # Mark wage-verification fields as N/A when null instead of RED.
+    if (cert_type or "").upper() == "AR-SC":
+        for fs in card.fields:
+            if fs.field_name in _AR_SC_NA_FIELDS and fs.value is None:
+                fs.mark_na("Not applicable for AR-SC (TIC is source of truth)")
 
     income_type = (vals.get("incomeType") or "").lower()
 

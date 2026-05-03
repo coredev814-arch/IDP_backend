@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.dependencies import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
-from app.routers import health, pdf
+from app.routers import health, pdf, webhook
 
 
 @asynccontextmanager
@@ -14,7 +14,16 @@ async def lifespan(_app: FastAPI):
     settings = get_settings()
     setup_logging(settings)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
-    yield
+
+    # Start the audit poller as a background thread when audit_mode is
+    # "poll" or "both". In "webhook" mode (default) this is a no-op —
+    # the FastAPI server only listens for incoming webhooks.
+    from app.services.audit.poller import start_poller_thread, stop_poller_thread
+    start_poller_thread()
+    try:
+        yield
+    finally:
+        stop_poller_thread()
 
 
 def create_app() -> FastAPI:
@@ -43,6 +52,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(pdf.router)
+    app.include_router(webhook.router)
 
     return app
 

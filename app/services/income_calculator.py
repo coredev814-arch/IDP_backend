@@ -204,63 +204,83 @@ def calculate_all_methods(
     matching_paystubs: list[PayStubEntry],
     funding_program: str | None = None,
 ) -> list[IncomeCalculationResult]:
-    """Run all applicable income calculation methods for one source.
+    """Compute annual income for one source using SOURCE-OF-TRUTH routing.
 
-    Args:
-        vi_entry: verification income entry (may be None if only paystubs)
-        matching_paystubs: paystubs for this income source
-        funding_program: for hours range resolution
+    Selects ONE primary method per source based on the documents present:
+      paystubs (≥3)         → paystub-based
+      VOI w/ rate + hours   → voi-based  (employment wages)
+      Fixed-income type     → voi-based  (rate × 12 — SSA, pension, etc.)
+      Self-employment       → self-declared (annual net from affidavit)
+      Self-cert / TIC only  → self-declared (already annual)
 
-    Returns:
-        list of IncomeCalculationResult, one per method that produced a result
+    Other methods may run as audit_only entries — included in results so
+    findings can flag discrepancies, but the primary is the authoritative
+    annualIncome for downstream sums and rent calculations.
     """
     results: list[IncomeCalculationResult] = []
-    member_name = None
-    source_name = None
 
-    if vi_entry:
-        member_name = vi_entry.memberName
-        source_name = vi_entry.sourceName
+    member_name = vi_entry.memberName if vi_entry else (
+        matching_paystubs[0].memberName if matching_paystubs else None
+    )
+    source_name = vi_entry.sourceName if vi_entry else (
+        matching_paystubs[0].sourceName if matching_paystubs else None
+    )
 
-        # Classify income type for calculation routing
-        income_type = (vi_entry.incomeType or "").lower()
-        calc_mode = _classify_income_mode(income_type)
+    income_type = (vi_entry.incomeType or "").lower() if vi_entry else ""
+    calc_mode = _classify_income_mode(income_type)
 
-        # Method 1: Self-declared — routed by calc_mode.
-        # For fixed_monthly types (SSA, pension, child support) the
-        # selfDeclaredAmount is typically the ANNUAL total from a benefit
-        # letter or TIC column, not a monthly figure. frequencyOfPay
-        # describes when the person is PAID, not the amount's time basis.
-        # Blindly ×12 here double-annualizes (e.g. $16,976/yr × 12 = $203,716).
-        sd_amount = vi_entry.selfDeclaredAmount
-        if sd_amount:
-            try:
-                sd_val = float(sd_amount)
-                if calc_mode in ("fixed_monthly", "annual_net"):
-                    # Already annual — use as-is
-                    sd_str = f"{sd_val:.2f}"
-                    sd_details = f"Self-declared annual: {sd_str}"
-                else:
-                    # Employment — annualize by frequencyOfPay
-                    sd_str = calculate_self_declared(
-                        sd_amount, vi_entry.frequencyOfPay,
-                    )
-                    sd_details = f"Self-declared amount: {sd_str}"
-                if sd_str:
-                    results.append(IncomeCalculationResult(
-                        memberName=member_name,
-                        sourceName=source_name,
-                        method="self-declared",
-                        annualIncome=sd_str,
-                        details=sd_details,
-                    ))
-            except ValueError:
-                pass
+    # Determine the authoritative method for this source.
+    has_paystubs = len(matching_paystubs) >= 3
+    has_voi_wage = bool(
+        vi_entry
+        and calc_mode == "employment"
+        and vi_entry.rateOfPay
+        and vi_entry.frequencyOfPay
+        and vi_entry.hoursPerPayPeriod
+    )
+    has_fixed_rate = bool(
+        vi_entry
+        and calc_mode == "fixed_monthly"
+        and vi_entry.rateOfPay
+    )
+    has_self_employment = bool(
+        vi_entry
+        and calc_mode == "annual_net"
+        and (vi_entry.selfDeclaredAmount or vi_entry.rateOfPay)
+    )
+    has_self_declared = bool(
+        vi_entry and vi_entry.selfDeclaredAmount
+    )
 
-        # Method 2: VOI-based — route by income mode
+    if has_paystubs:
+        primary_method = "paystub-based"
+    elif has_voi_wage:
+        primary_method = "voi-based"
+    elif has_fixed_rate:
+        primary_method = "voi-based"
+    elif has_self_employment:
+        primary_method = "self-declared"
+    elif has_self_declared:
+        primary_method = "self-declared"
+    elif vi_entry and vi_entry.rateOfPay and vi_entry.frequencyOfPay:
+        primary_method = "voi-based"
+    else:
+        primary_method = None
+
+    # Compute the primary first.
+    if primary_method == "paystub-based":
+        ps_annual, ps_details = calculate_paystub_based(matching_paystubs)
+        if ps_annual:
+            results.append(IncomeCalculationResult(
+                memberName=member_name,
+                sourceName=source_name,
+                method="paystub-based",
+                annualIncome=ps_annual,
+                details=ps_details,
+            ))
+
+    elif primary_method == "voi-based" and vi_entry:
         if calc_mode == "fixed_monthly" and vi_entry.rateOfPay:
-            # Fixed monthly income (SSA, TANF, pension, child support)
-            # rate = monthly amount, annual = rate × 12
             try:
                 monthly = float(vi_entry.rateOfPay)
                 annual = monthly * 12
@@ -273,51 +293,8 @@ def calculate_all_methods(
                 ))
             except ValueError:
                 pass
-
-        elif calc_mode == "annual_net":
-            # Self-employment / business income
-            # Priority: selfDeclaredAmount (TIC column A) > rateOfPay
-            # The TIC already has the correct annual figure. The affidavit's
-            # "net income" field is also annual. LLM often mislabels freq as
-            # "monthly" causing ×12 inflation.
-            try:
-                # Use selfDeclaredAmount first — it's the TIC annual total
-                sd = vi_entry.selfDeclaredAmount
-                rate = vi_entry.rateOfPay
-                if sd:
-                    annual = float(sd)
-                    details = f"Business self-declared annual: {annual:.2f} (from TIC/affidavit)"
-                elif rate:
-                    amount = float(rate)
-                    freq = (vi_entry.frequencyOfPay or "").lower()
-                    # For business income, assume amount is annual unless
-                    # freq is clearly periodic (weekly/bi-weekly)
-                    if freq in ("weekly", "bi-weekly"):
-                        mult = get_frequency_multiplier(freq) or 1
-                        annual = amount * mult
-                        details = f"Business periodic: {amount:.2f} × {mult} = {annual:.2f}"
-                    else:
-                        # Monthly or annual or unspecified — treat as annual net
-                        # (self-employment affidavits report annual net from Schedule C)
-                        annual = amount
-                        details = f"Business/self-employment annual net: {annual:.2f}"
-                else:
-                    annual = None
-
-                if annual is not None:
-                    results.append(IncomeCalculationResult(
-                        memberName=member_name,
-                        sourceName=source_name,
-                        method="voi-based",
-                        annualIncome=f"{annual:.2f}",
-                        details=details,
-                    ))
-            except ValueError:
-                pass
-
-        elif calc_mode == "employment" and (vi_entry.rateOfPay or vi_entry.frequencyOfPay):
-            # Employment income — rate × hours × 52 (hourly) or rate × multiplier (periodic)
-            voi_annual, voi_details, voi_findings = calculate_voi_based(
+        elif calc_mode == "employment":
+            voi_annual, voi_details, _ = calculate_voi_based(
                 vi_entry.rateOfPay,
                 vi_entry.frequencyOfPay,
                 vi_entry.hoursPerPayPeriod,
@@ -333,9 +310,8 @@ def calculate_all_methods(
                     annualIncome=voi_annual,
                     details=voi_details,
                 ))
-
-        elif vi_entry.rateOfPay and vi_entry.frequencyOfPay:
-            # Unknown type but has rate+freq — use frequency multiplier only (no hours)
+        else:
+            # Unknown type with rate+freq
             try:
                 rate = float(vi_entry.rateOfPay)
                 mult = get_frequency_multiplier(vi_entry.frequencyOfPay)
@@ -351,8 +327,28 @@ def calculate_all_methods(
             except ValueError:
                 pass
 
-        # Method 3: YTD-based (not for fixed or annual-net income)
-        if calc_mode == "employment":
+    elif primary_method == "self-declared" and vi_entry and vi_entry.selfDeclaredAmount:
+        # selfDeclaredAmount is treated as ALREADY ANNUAL.
+        # This is true for: TIC Part III (annual columns), self-employment
+        # affidavits (Schedule C net income), cash gift affidavits, child
+        # support self-cert. The schema convention is annual.
+        try:
+            annual = float(vi_entry.selfDeclaredAmount)
+            results.append(IncomeCalculationResult(
+                memberName=member_name,
+                sourceName=source_name,
+                method="self-declared",
+                annualIncome=f"{annual:.2f}",
+                details=f"Self-declared annual: {annual:.2f}",
+            ))
+        except ValueError:
+            pass
+
+    # Audit methods — run for cross-validation but don't override primary.
+    # These help findings layer flag discrepancies without affecting sums.
+    if vi_entry:
+        # YTD-based audit (employment only)
+        if calc_mode == "employment" and primary_method != "ytd-based":
             ytd_annual, ytd_details = calculate_ytd_based(
                 vi_entry.ytdAmount,
                 vi_entry.ytdStartDate,
@@ -364,23 +360,8 @@ def calculate_all_methods(
                     sourceName=source_name,
                     method="ytd-based",
                     annualIncome=ytd_annual,
-                    details=ytd_details,
+                    details=f"[audit] {ytd_details}",
                 ))
-    elif matching_paystubs:
-        member_name = matching_paystubs[0].memberName
-        source_name = matching_paystubs[0].sourceName
-
-    # Method 4: Pay-stub-based
-    if matching_paystubs:
-        ps_annual, ps_details = calculate_paystub_based(matching_paystubs)
-        if ps_annual:
-            results.append(IncomeCalculationResult(
-                memberName=member_name or (matching_paystubs[0].memberName if matching_paystubs else None),
-                sourceName=source_name or (matching_paystubs[0].sourceName if matching_paystubs else None),
-                method="paystub-based",
-                annualIncome=ps_annual,
-                details=ps_details,
-            ))
 
     return results
 

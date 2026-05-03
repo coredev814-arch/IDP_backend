@@ -126,6 +126,27 @@ ANTI-HALLUCINATION GUARD (CRITICAL):
 - NEVER map unrelated numbers (e.g., security deposit, utility schedule,
   passbook rate, field numbers like "30" or "31") to rent fields.
 
+NUMBER FORMAT — THOUSANDS SEPARATORS (CRITICAL):
+US dollar amounts use COMMA as thousands separator and PERIOD as decimal.
+  "$2,418"     → 2418.00 (NOT 2.42)
+  "$2,418.00"  → 2418.00
+  "$1,234.56"  → 1234.56
+  "$54,403"    → 54403.00 (NOT 54.40)
+  "$700,000"   → 700000.00 (NOT 700.00)
+Always strip commas before parsing. The comma is a separator, NEVER a decimal.
+A rent or income figure under $50 is almost always wrong — re-read the source
+and check whether you dropped digits after a comma.
+
+MAGNITUDE SANITY CHECKS:
+- grossRent / tenantRent / utilityAllowance: typical range $50–$5,000/month.
+  Values under $50 are implausible — verify against source text.
+- householdIncome: typical range $5,000–$200,000/year.
+- rentLimit: typical range $200–$5,000/month.
+- numberOfBedrooms: 0–8 (studio = 0).
+If your extracted value falls outside these ranges, re-read the document and
+look for missed digits before/after a decimal or comma. Better to return null
+than a value that's off by 100×.
+
 FIELDS TO EXTRACT:
 - certificationType: Certification type code. Values: "MI" (Move-In/Initial), "AR" (Annual Recertification), "AR-SC" (Annual Recert Self-Certification), "IR" (Interim Recertification). Look for: "Type of Certification" field, checkboxes for Initial/Annual/Interim, or coded fields on the form.
 - effectiveDate: Effective date of the certification. YYYY-MM-DD format.
@@ -176,6 +197,18 @@ CRITICAL RULES:
 DOCUMENT ROUTING:
 - payStub route: Pay stubs, pay-slips, Work Number/Equifax/ScreeningWorks/Vault Verify wage records
 - verificationIncome route: SSA/EIV benefit letters, TANF, child support, cash contributions, pension, self-employment, sworn statements, VOI/VOE
+
+SSA COLA NOTICE — EXTRACT THE LISTED MONTHLY AMOUNT:
+A "Notice of Cost-of-Living Adjustment (COLA)" letter from SSA is a CURRENT
+benefit statement, not a future projection. The monthly amount in the
+"How Much You Will Get In [year]" table IS the current monthly benefit:
+  - rateOfPay: the "before deductions" monthly amount (e.g. $925.90)
+  - frequencyOfPay: "monthly"
+  - selfDeclaredAmount: same monthly figure (extractor will annualize)
+  - incomeType: "Social Security"
+  - type_of_VOI: "SSA Benefit Letter"
+Do NOT skip the dollar amount because the letter says "will increase" — the
+current rate IS the new rate. Extract every dollar figure you see.
 
 CHILD SUPPORT STATEMENT — ALWAYS EXTRACT:
 Any "Child Support Statement", "Child Support Order", "Child Support Verification",
@@ -252,6 +285,13 @@ CRITICAL RULES:
 - SSN MASKING: ALWAYS ***-**-XXXX.
 - NAME FORMATTING: ALWAYS Title Case.
 - If document is a Calculation Worksheet, return {"assetInformation": []} immediately.
+- PROCESS EVERY DOCUMENT separated by "---". The input may contain 5+ asset
+  documents (multiple bank VOAs, a real estate worksheet, life insurance,
+  etc.). Each distinct account or property = ONE separate entry in the
+  output array. Do NOT stop after the first few. Do NOT skip pages.
+- Before returning, count the asset documents in the input — your output
+  array length should be at least equal to the number of distinct accounts/
+  properties shown across all documents.
 
 DOCUMENT ROUTING:
 - bankStatment route: actual bank statements with transactions
@@ -285,6 +325,43 @@ SPECIAL RULES:
 - Joint/shared accounts: capture percentageOfOwnership. If ownership is split (e.g., 50% with non-household member), record the percentage
 - Each distinct account = separate array entry
 - Do NOT extract from manager worksheets (Asset Self-Certification — Manager's Worksheet)
+
+REAL ESTATE WORKSHEET / DEED / APPRAISAL:
+Always extract real estate as a separate asset record. Use the LABELS on
+the form to find values — do NOT trust line numbers, since worksheet
+formatting varies. Look for these labels (in this order of preference):
+  - currentBalance: "Total Cash Value", "Net Value", "Cash Value of Real
+    Estate", "Equity" — the value of the OWNER'S equity (after mortgage
+    and closing costs). This is typically the largest dollar figure on
+    the worksheet, often $50,000+ for owned property.
+  - incomeAmount: "Net Income from Asset", "Annual Net Income", or
+    "Income from Asset". Can be negative (rental loss) or zero.
+  - realEstateCurrentMarketValue: "Current Market Value", "Market Value",
+    "Appraised Value" — typically larger than currentBalance.
+  - totalClosingCosts: "Total Closing Costs" or 10% of market value.
+  - currentMortgageBalance: "Current Mortgage Balance".
+  - sourceName: property address (e.g. "50 Juniper Lane, Framingham, MA").
+  - documentType: "Real Estate"
+  - accountType: "Real Estate"
+
+MAGNITUDE CHECK FOR REAL ESTATE:
+- currentBalance < $1,000 is implausible for owned real estate. If your
+  parsed value is small, you've picked up a "Total Rental Income: $0" or
+  a "Net Income: -$9,124" line by mistake. Re-read for the larger equity
+  figure (typically 5-7 digits).
+- realEstateCurrentMarketValue should be ≥ currentBalance (market value
+  ≥ owner's equity).
+
+TD BANK VOA / VERIFICATION OF DEPOSIT format:
+A TD Bank VOA shows a table: Account Number | Type | Open Date | Current
+Balance | Average Balance (6 months) | APR. Extract:
+  - documentType: "Verification of Assets"
+  - sourceName: "TD Bank"
+  - accountType: "Checking" or "Savings" from Type column
+  - accountNumber: last 4-8 digits
+  - currentBalance: Current Balance column
+  - averageSixMonthBalance: Average Balance column
+  - verificationOfAsset: populate the nested object
 
 HUD 50059 / TIC ASSET EXTRACTION:
 - HUD 50059 Section D contains asset information (fields 76-80): Description, Status, Cash Value, Actual Yearly Income, Date Divested
@@ -541,7 +618,15 @@ ANTI-HALLUCINATION GUARD (CRITICAL):
 - Do NOT map field numbers ("30", "31", "86"), line numbers, percentages,
   or unrelated figures (security deposit, passbook rate) to rent fields.
 - For zero-income households where all income sources show $0, return
-  "0.00" for householdIncome — not a guess, not null."""
+  "0.00" for householdIncome — not a guess, not null.
+
+NUMBER FORMAT (CRITICAL):
+US dollar amounts: comma = thousands separator, period = decimal.
+  "$2,418"   → 2418.00 (NOT 2.42)
+  "$54,403"  → 54403.00 (NOT 54.40)
+  "$700,000" → 700000.00
+ALWAYS strip commas before parsing. Rent under $50 or income under $1,000
+is almost always wrong — re-read for missed digits."""
 
 
 def _retry_cert_info_fields(
@@ -615,12 +700,34 @@ def extract_income(
     return IncomeExtraction.model_validate(result)
 
 
+_ASSET_DOC_TYPES_PER_RECORD = {
+    # Document types that typically yield ONE asset record per document.
+    # Used for gap detection — if extraction count is far below the count
+    # of these doc types in the input, retry with the missed groups.
+    "Bank Statement",
+    "Verification of Assets (VOA)",
+    "Verification of Deposit (VOD)",
+    "Life Insurance Policy",
+    "Asset Self-Certification",
+    "Real Estate",
+    "Investment Account Statement",
+    "Direct Express Card Verification",
+    "Debit Card Asset Self-Certification",
+}
+
+
 def extract_assets(
     groups: list[DocumentGroup],
     settings: Settings,
     certification_type: str | None = None,
 ) -> AssetExtraction:
-    """Extract asset data from pre-routed asset document groups."""
+    """Extract asset data from pre-routed asset document groups.
+
+    After the first extraction, if the number of records is suspiciously
+    low compared to the number of asset documents in the input, retry the
+    missed groups with a targeted prompt. This catches the common LLM
+    failure mode of dropping records when 5+ asset documents are sent at once.
+    """
     relevant_texts = _build_texts(groups)
     if not relevant_texts:
         logger.info("No asset documents found")
@@ -632,11 +739,144 @@ def extract_assets(
     result = call_llm_json(ASSET_SYSTEM_PROMPT, user_prompt, settings)
     result = validation.validate_assets(result)
 
-    logger.info(
-        "Extracted %d asset records",
-        len(result.get("assetInformation", [])),
-    )
+    asset_records = result.get("assetInformation", []) or []
+    logger.info("Extracted %d asset records (initial pass)", len(asset_records))
+
+    # Gap detection: count asset-yielding doc groups vs extracted records.
+    # Each Bank Statement / VOA / Real Estate / etc. group should produce
+    # at least one record. If we're way short, retry the missed groups.
+    expected_groups = [
+        g for g in groups
+        if g.document_type in _ASSET_DOC_TYPES_PER_RECORD
+    ]
+    if expected_groups and len(asset_records) < len(expected_groups):
+        retry_records = _retry_missed_asset_groups(
+            asset_records, expected_groups, certification_type, settings,
+        )
+        if retry_records:
+            before = len(asset_records)
+            merged = _dedupe_asset_records(asset_records + retry_records)
+            added = len(merged) - before
+            if added > 0:
+                asset_records = merged
+                result["assetInformation"] = asset_records
+                logger.info(
+                    "Asset retry added %d new records after dedup (total now %d)",
+                    added, len(asset_records),
+                )
+            else:
+                logger.info(
+                    "Asset retry returned %d records but all were duplicates — kept initial set",
+                    len(retry_records),
+                )
+
     return AssetExtraction.model_validate(result)
+
+
+def _asset_record_key(rec: dict) -> tuple:
+    """Stable identity key for asset deduplication.
+
+    Combines (sourceName, accountType, accountNumber). Two records that
+    share all three are the same asset extracted twice.
+    """
+    src = (rec.get("sourceName") or "").lower().strip()
+    acct_type = (rec.get("accountType") or "").lower().strip()
+    acct_num = (rec.get("accountNumber") or "").lower().strip()
+    return (src, acct_type, acct_num)
+
+
+def _dedupe_asset_records(records: list[dict]) -> list[dict]:
+    """Drop duplicate asset records, preferring the more complete one.
+
+    Two records are duplicates if (sourceName, accountType, accountNumber)
+    match. When merging, the record with more populated fields wins; if
+    tied, the first one is kept.
+    """
+    seen: dict[tuple, dict] = {}
+    for rec in records:
+        key = _asset_record_key(rec)
+        # Records with no identifying signature (all-null key) are kept
+        # as-is — can't safely merge them.
+        if key == ("", "", ""):
+            # Use object id as unique key
+            seen[("__nokey__", id(rec), 0)] = rec
+            continue
+
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = rec
+            continue
+
+        # Prefer the record with more non-null fields
+        existing_score = sum(1 for v in existing.values() if v not in (None, "", []))
+        new_score = sum(1 for v in rec.values() if v not in (None, "", []))
+        if new_score > existing_score:
+            seen[key] = rec
+
+    return list(seen.values())
+
+
+def _retry_missed_asset_groups(
+    extracted: list[dict],
+    expected_groups: list[DocumentGroup],
+    certification_type: str | None,
+    settings: Settings,
+) -> list[dict]:
+    """Identify asset groups whose pages aren't represented in extracted
+    records, then send a targeted retry for just those groups.
+
+    Matching uses sourceName + accountNumber only (not assetOwner — owner
+    name appears on every page in single-person households and would mark
+    all groups as covered).
+    """
+    extracted_signatures: set[str] = set()
+    for rec in extracted:
+        # sourceName: institution-specific, good signal
+        src = rec.get("sourceName")
+        if src and len(str(src).strip()) >= 4:
+            extracted_signatures.add(str(src).lower().strip())
+        # accountNumber: very specific
+        acct = rec.get("accountNumber")
+        if acct and len(str(acct).strip()) >= 4:
+            extracted_signatures.add(str(acct).lower().strip())
+
+    missed_groups: list[DocumentGroup] = []
+    for g in expected_groups:
+        text_lower = (g.combined_text or "").lower()
+        # Skip if any extracted record's signature appears in this group text
+        if any(sig in text_lower for sig in extracted_signatures):
+            continue
+        missed_groups.append(g)
+
+    if not missed_groups:
+        return []
+
+    logger.info(
+        "Asset retry: %d missed groups (types: %s)",
+        len(missed_groups),
+        [g.document_type for g in missed_groups],
+    )
+
+    missed_texts = _build_texts(missed_groups)
+    if not missed_texts:
+        return []
+
+    retry_prompt = (
+        "These asset documents were missed in the first extraction pass. "
+        "Extract a separate asset record for EACH document below — do NOT "
+        "skip any. Return only the new records, not the previously extracted "
+        "ones.\n\n"
+        + "\n\n---\n\n".join(missed_texts)
+    )
+    retry_prompt += _get_cert_context(certification_type)
+
+    try:
+        retry_result = call_llm_json(ASSET_SYSTEM_PROMPT, retry_prompt, settings)
+        retry_result = validation.validate_assets(retry_result)
+        return retry_result.get("assetInformation", []) or []
+    except Exception:
+        logger.exception("Asset retry call failed — keeping initial records")
+        return []
 
 
 def extract_document_inventory_financial(
