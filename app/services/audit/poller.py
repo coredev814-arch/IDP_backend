@@ -29,26 +29,55 @@ from app.services.audit.job_store import (
     get_job_store,
 )
 from app.services.audit.jobs import run_comparison, run_extraction
-from app.services.salesforce.client import get_salesforce_client
+from app.services.salesforce.client import _escape_soql, get_salesforce_client
 
 logger = logging.getLogger(__name__)
 
 
-_READY_QUERY = """
+# SOQL `IN` clauses are limited (default ~4 KB query length, practical
+# safe ceiling ~200 IDs). We chunk the exclusion list if it grows beyond.
+_MAX_EXCLUDE_IDS_PER_QUERY = 200
+
+
+def _build_ready_query(limit: int, exclude_ids: set[str]) -> str:
+    """Build the SOQL query, excluding already-known case IDs.
+
+    Cases stay marked `IDP_File_Process_Status__c = 'Processed'` forever
+    in Salesforce, so without this filter the poller would re-fetch the
+    same cases on every cycle. The exclusion list comes from the local
+    JobStore so we never re-process cases already in flight or completed.
+    """
+    where_parts = [
+        "IDP_File_Process_Status__c = 'Processed'",
+        "IDP_Phase_1_Review__c = true",
+        "IDP_Process_Complete__c != null",
+    ]
+    if exclude_ids:
+        # Limit to a safe number of IDs per query — extra cases will be
+        # caught on subsequent poll cycles as the exclusion list shrinks.
+        ids_subset = list(exclude_ids)[:_MAX_EXCLUDE_IDS_PER_QUERY]
+        ids_str = ", ".join(f"'{_escape_soql(i)}'" for i in ids_subset)
+        where_parts.append(f"Id NOT IN ({ids_str})")
+
+    where_clause = "\n  AND ".join(where_parts)
+    return f"""
 SELECT Id, CaseNumber, CertType__c, Funding_Program2__c
 FROM Case
-WHERE IDP_File_Process_Status__c = 'Processed'
-  AND IDP_Phase_1_Review__c = true
-  AND IDP_Process_Complete__c != null
+WHERE {where_clause}
 ORDER BY IDP_Process_Complete__c ASC
 LIMIT {limit}
-"""
+""".strip()
 
 
-def fetch_ready_cases(settings: Settings, limit: int) -> list[dict]:
-    """Query Salesforce for cases with MuleSoft processing complete."""
+def fetch_ready_cases(
+    settings: Settings,
+    limit: int,
+    exclude_ids: set[str] | None = None,
+) -> list[dict]:
+    """Query Salesforce for ready cases, excluding already-known IDs."""
     sf = get_salesforce_client(settings)
-    result = sf.sf.query(_READY_QUERY.format(limit=limit))
+    query = _build_ready_query(limit, exclude_ids or set())
+    result = sf.sf.query(query)
     return result.get("records", [])
 
 
@@ -109,14 +138,43 @@ def process_case(case_record: dict, settings: Settings) -> None:
 
 
 def poll_once(settings: Settings) -> int:
-    """Run one polling cycle. Returns count of cases processed."""
-    cases = fetch_ready_cases(settings, settings.audit_poll_batch_size)
+    """Run one polling cycle. Returns count of cases processed.
+
+    Builds the exclusion list from the local JobStore — already-known
+    case IDs (in any state except failed) are filtered out at the SOQL
+    level so we don't waste API calls on cases we've already handled.
+
+    Failed cases (extraction/comparison/timeout) are NOT excluded — they
+    get retried on the next poll cycle.
+    """
+    store = get_job_store(settings.audit_job_db)
+    known = store.list_known_case_ids()
+    failed = store.list_failed_case_ids()
+    exclude_ids = known - failed   # exclude all known except failed (retry those)
+
+    cases = fetch_ready_cases(
+        settings,
+        settings.audit_poll_batch_size,
+        exclude_ids=exclude_ids,
+    )
     if not cases:
         return 0
 
+    logger.info(
+        "Poll cycle: fetched %d ready case(s) (excluded %d known IDs, %d failed eligible for retry)",
+        len(cases), len(exclude_ids), len(failed),
+    )
+
     processed = 0
     for case in cases:
+        # Defense-in-depth: re-check locally after Salesforce returns
+        # results, in case another worker claimed it between query and
+        # processing (multi-worker scenarios).
         if is_already_processed(case["Id"], settings):
+            logger.debug(
+                "Skipping case %s — already in non-restartable state",
+                case.get("CaseNumber") or case["Id"],
+            )
             continue
         try:
             process_case(case, settings)

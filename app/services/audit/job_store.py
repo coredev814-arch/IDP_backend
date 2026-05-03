@@ -247,6 +247,27 @@ class JobStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def list_known_case_ids(self) -> set[str]:
+        """Return all case IDs IDP has touched (in any state).
+
+        Used by the poller to exclude already-known cases from the
+        Salesforce SOQL query so the same case isn't fetched repeatedly.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT case_id FROM audit_jobs"
+            ).fetchall()
+            return {r["case_id"] for r in rows}
+
+    def list_failed_case_ids(self) -> set[str]:
+        """Case IDs in failed states — eligible for retry on next poll."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT case_id FROM audit_jobs
+                WHERE state IN (?, ?, ?)
+            """, (EXTRACTION_FAILED, COMPARISON_FAILED, MULESOFT_TIMEOUT)).fetchall()
+            return {r["case_id"] for r in rows}
+
 
 _SINGLETON: JobStore | None = None
 _SINGLETON_LOCK = threading.Lock()
