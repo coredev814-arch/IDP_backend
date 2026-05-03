@@ -5,6 +5,7 @@ Pure logic — no Salesforce calls, no I/O. Takes two dicts in, returns a result
 """
 import logging
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,41 @@ def _normalize_income_source(name: str | None) -> str:
     return raw
 
 
+# Common organizational suffixes/prefixes — stripped before fuzzy matching
+# so "Coherent Corp" matches "Coherent", "The Walt Disney Company" matches
+# "Walt Disney Company", etc.
+_ORG_SUFFIXES = {
+    "corp", "corporation", "inc", "incorporated", "llc", "l.l.c",
+    "ltd", "limited", "co", "company", "lp", "l.p", "llp",
+    "plc", "pllc", "pc", "p.c", "group", "holdings",
+}
+_ORG_PREFIXES = {"the", "a", "an"}
+
+
+def _normalize_org_name(name: str | None) -> str:
+    """Strip common corporate suffixes/prefixes for fuzzy comparison.
+
+    Examples:
+      'Coherent Corp'             → 'coherent'
+      'The Walt Disney Company'   → 'walt disney'
+      'B&T Building Services Inc' → 'b&t building services'
+      'XYZ, LLC.'                 → 'xyz'
+    """
+    raw = _norm(name)
+    if not raw:
+        return ""
+    # Strip punctuation that commonly appears in business names
+    cleaned = raw.replace(",", " ").replace(".", " ").replace("'", "")
+    tokens = [t for t in cleaned.split() if t]
+    # Drop trailing org suffixes
+    while tokens and tokens[-1] in _ORG_SUFFIXES:
+        tokens.pop()
+    # Drop leading articles
+    while tokens and tokens[0] in _ORG_PREFIXES:
+        tokens.pop(0)
+    return " ".join(tokens) if tokens else raw
+
+
 # ---------------------------------------------------------------------------
 # Member comparison
 # ---------------------------------------------------------------------------
@@ -182,33 +218,63 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
     ai_only_keys = ai_keys.keys() - sf_keys_set
     sf_only_keys = sf_keys_set - ai_keys.keys()
 
-    # Name-based fallback match: if a member is "missing" in one system
-    # but a same-named member exists in the other, treat as matched (with
-    # a flag — not as both directions of missing).
-    ai_only_by_name = {
-        _member_name_key(ai_keys[k]): k for k in ai_only_keys
-    }
-    sf_only_by_name = {
-        _member_name_key(sf_keys[k][0]): k for k in sf_only_keys
-    }
-    name_matches = set(ai_only_by_name) & set(sf_only_by_name)
-    name_matches.discard("")  # ignore empty names
+    # Name-based fuzzy fallback: if a member's strict (DOB, SSN) key
+    # doesn't match across systems but their NAMES are similar (e.g.,
+    # "Yvet Belen" vs "Yvett Belen" — single-letter OCR variant), treat
+    # as matched and surface a low-severity mismatch finding instead of
+    # flagging both directions as missing.
+    ai_only_with_names = [
+        (_member_name_key(ai_keys[k]), k) for k in ai_only_keys
+    ]
+    sf_only_with_names = [
+        (_member_name_key(sf_keys[k][0]), k) for k in sf_only_keys
+    ]
 
-    fallback_matched_ai_keys = {ai_only_by_name[n] for n in name_matches}
-    fallback_matched_sf_keys = {sf_only_by_name[n] for n in name_matches}
+    fallback_matched_ai_keys: set[tuple[str, str]] = set()
+    fallback_matched_sf_keys: set[tuple[str, str]] = set()
+    fuzzy_match_pairs: list[tuple[str, str]] = []
+
+    for ai_name, ai_k in ai_only_with_names:
+        if not ai_name:
+            continue
+        best_ratio = 0.0
+        best_sf_key: tuple[str, str] | None = None
+        best_sf_name: str = ""
+        for sf_name, sf_k in sf_only_with_names:
+            if not sf_name or sf_k in fallback_matched_sf_keys:
+                continue
+            # SequenceMatcher.ratio: 1.0 = identical, 0.0 = nothing in common.
+            # 0.85 catches single-letter typos ("Yvet" / "Yvett" → 0.95)
+            # without false-matching distinct names ("Smith" / "Smyth" → 0.80).
+            ratio = SequenceMatcher(None, ai_name, sf_name).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_sf_key = sf_k
+                best_sf_name = sf_name
+        if best_ratio >= 0.85 and best_sf_key is not None:
+            fallback_matched_ai_keys.add(ai_k)
+            fallback_matched_sf_keys.add(best_sf_key)
+            fuzzy_match_pairs.append((ai_name, best_sf_name))
 
     ai_only = ai_only_keys - fallback_matched_ai_keys
     sf_only = sf_only_keys - fallback_matched_sf_keys
 
-    # Surface the fuzzy matches as a different (lower-severity) finding
-    for name in name_matches:
+    # Surface the fuzzy matches as a single low-severity finding per pair
+    for ai_name, sf_name in fuzzy_match_pairs:
+        if ai_name == sf_name:
+            msg = (
+                f"Member identity mismatch — '{ai_name.title()}' exists in "
+                f"both systems but DOB/SSN keys differ"
+            )
+        else:
+            msg = (
+                f"Name spelling variant — AI: '{ai_name.title()}' vs "
+                f"MuleSoft: '{sf_name.title()}' (likely same person)"
+            )
         findings.append(Finding(
             category=VALUE_MISMATCH,
             severity="low",
-            message=(
-                f"Member identity mismatch — '{name.title()}' exists in both systems "
-                f"but DOB/SSN keys differ (likely OCR/data entry difference)"
-            ),
+            message=msg,
         ))
 
     for k in ai_only:
@@ -300,8 +366,7 @@ def _compare_income(
         k = _income_key(inc)
         sf_keys.setdefault(k, []).append(inc)
 
-    # Detect SF duplicates that look like the same source with slight name diff
-    sf_norm_sources = {k[0] for k in sf_keys if k[0]}
+    # Detect SF duplicates within the same canonical source name
     for k, group in sf_keys.items():
         if len(group) > 1 and k[0]:
             findings.append(Finding(
@@ -315,8 +380,49 @@ def _compare_income(
 
     ai_keys = set(_income_key(r) for r in ai_income)
     matched = ai_keys & set(sf_keys.keys())
-    ai_only = ai_keys - set(sf_keys.keys())
-    sf_only = set(sf_keys.keys()) - ai_keys
+    ai_only_keys = ai_keys - set(sf_keys.keys())
+    sf_only_keys = set(sf_keys.keys()) - ai_keys
+
+    # Fuzzy-match remaining AI-only and SF-only sources by name similarity.
+    # Catches employer name variants like:
+    #   "b&t building services" (AI) vs "b&t services inc." (SF)
+    #   "ABC Staffing LLC" (AI)   vs "ABC Staffing"        (SF)
+    # Same threshold (0.85) as member fuzzy matching.
+    fuzzy_matched_ai: set[tuple[str, str]] = set()
+    fuzzy_matched_sf: set[tuple[str, str]] = set()
+    fuzzy_pairs: list[tuple[tuple[str, str], tuple[str, str]]] = []
+
+    sf_only_list = list(sf_only_keys)
+    for ai_k in ai_only_keys:
+        if not ai_k[0]:    # skip empty source names
+            continue
+        ai_normalized = _normalize_org_name(ai_k[0])
+        best_ratio = 0.0
+        best_sf_k: tuple[str, str] | None = None
+        for sf_k in sf_only_list:
+            if sf_k in fuzzy_matched_sf or not sf_k[0]:
+                continue
+            # Match by source name similarity AND same member (or empty member).
+            # If both have member names, they must also fuzzy-match.
+            if ai_k[1] and sf_k[1]:
+                member_ratio = SequenceMatcher(None, ai_k[1], sf_k[1]).ratio()
+                if member_ratio < 0.7:
+                    continue
+            sf_normalized = _normalize_org_name(sf_k[0])
+            # Strip corporate suffixes/prefixes BEFORE comparing — catches
+            # "Coherent Corp" ↔ "Coherent", "The Walt Disney Company" ↔
+            # "Walt Disney Company", etc.
+            source_ratio = SequenceMatcher(None, ai_normalized, sf_normalized).ratio()
+            if source_ratio > best_ratio:
+                best_ratio = source_ratio
+                best_sf_k = sf_k
+        if best_ratio >= 0.85 and best_sf_k is not None:
+            fuzzy_matched_ai.add(ai_k)
+            fuzzy_matched_sf.add(best_sf_k)
+            fuzzy_pairs.append((ai_k, best_sf_k))
+
+    ai_only = ai_only_keys - fuzzy_matched_ai
+    sf_only = sf_only_keys - fuzzy_matched_sf
 
     agreements = 0
     disagreements = 0
@@ -344,6 +450,19 @@ def _compare_income(
                 ))
         else:
             agreements += 1     # both present, can't compare values
+
+    # Surface fuzzy-matched income sources as low-severity name variants.
+    # Treat as agreements for confidence scoring (both systems have it).
+    for ai_k, sf_k in fuzzy_pairs:
+        agreements += 1
+        findings.append(Finding(
+            category=VALUE_MISMATCH,
+            severity="low",
+            message=(
+                f"Income source name variant — AI: '{ai_k[0]}' vs "
+                f"MuleSoft: '{sf_k[0]}' (likely same source)"
+            ),
+        ))
 
     for k in ai_only:
         findings.append(Finding(
@@ -428,8 +547,67 @@ def _compare_assets(
 
     ai_keys = {_asset_key(a): a for a in ai_assets}
     matched = ai_keys.keys() & set(sf_keys.keys())
-    ai_only = ai_keys.keys() - set(sf_keys.keys())
-    sf_only = set(sf_keys.keys()) - ai_keys.keys()
+    ai_only_keys = ai_keys.keys() - set(sf_keys.keys())
+    sf_only_keys = set(sf_keys.keys()) - ai_keys.keys()
+
+    # Fuzzy-match remaining assets by sourceName similarity + same accountType
+    # + close balance. Catches variants like:
+    #   "Knights Of Columbus" (AI) vs "4633 KOC" (MuleSoft)
+    #   "The Walt Disney Company" (AI) vs "Walt Disney Company" (MuleSoft)
+    fuzzy_matched_ai_assets: set[tuple] = set()
+    fuzzy_matched_sf_assets: set[tuple] = set()
+    asset_fuzzy_pairs: list[tuple[tuple, tuple]] = []
+
+    sf_only_list = list(sf_only_keys)
+    for ai_k in ai_only_keys:
+        ai_rec = ai_keys[ai_k]
+        ai_src_norm = _normalize_org_name(ai_k[0])
+        ai_type = ai_k[1]
+        ai_bal = _money(ai_rec.get("currentBalance"))
+        if not ai_src_norm and ai_bal is None:
+            continue   # nothing to fuzzy-match on
+
+        best_score = 0.0
+        best_sf_k: tuple | None = None
+        for sf_k in sf_only_list:
+            if sf_k in fuzzy_matched_sf_assets:
+                continue
+            # accountType must match (Checking ↔ Checking, Savings ↔ Savings)
+            if ai_type and sf_k[1] and ai_type != sf_k[1]:
+                continue
+            sf_rec = sf_keys[sf_k][0]
+            sf_src_norm = _normalize_org_name(sf_k[0])
+            sf_bal = _money(
+                sf_rec.get("Cash_Value__c") or sf_rec.get("VOA_Current__c")
+            )
+
+            # Score = combination of name similarity and balance match
+            name_score = 0.0
+            if ai_src_norm and sf_src_norm:
+                name_score = SequenceMatcher(None, ai_src_norm, sf_src_norm).ratio()
+            balance_match = (
+                ai_bal is not None and sf_bal is not None
+                and _close(ai_bal, sf_bal, tolerance=0.02)
+            )
+
+            # Strong match: balance matches AND (name similar OR one source is empty)
+            if balance_match and (name_score >= 0.85 or not ai_src_norm or not sf_src_norm):
+                if name_score > best_score:
+                    best_score = max(name_score, 0.86)
+                    best_sf_k = sf_k
+            # Moderate match: name very similar AND no balance contradiction
+            elif name_score >= 0.85 and (ai_bal is None or sf_bal is None or balance_match):
+                if name_score > best_score:
+                    best_score = name_score
+                    best_sf_k = sf_k
+
+        if best_score >= 0.85 and best_sf_k is not None:
+            fuzzy_matched_ai_assets.add(ai_k)
+            fuzzy_matched_sf_assets.add(best_sf_k)
+            asset_fuzzy_pairs.append((ai_k, best_sf_k))
+
+    ai_only = ai_only_keys - fuzzy_matched_ai_assets
+    sf_only = sf_only_keys - fuzzy_matched_sf_assets
 
     agreements = 0
     disagreements = 0
@@ -455,6 +633,21 @@ def _compare_assets(
                 ))
         else:
             agreements += 1
+
+    # Surface fuzzy-matched assets as low-severity name variants.
+    # Treat as agreements for confidence scoring.
+    for ai_k, sf_k in asset_fuzzy_pairs:
+        agreements += 1
+        ai_src = ai_keys[ai_k].get("sourceName") or "(unnamed)"
+        sf_src = sf_keys[sf_k][0].get("Source_Name__c") or "(unnamed)"
+        findings.append(Finding(
+            category=VALUE_MISMATCH,
+            severity="low",
+            message=(
+                f"Asset name variant — AI: '{ai_src}' vs "
+                f"MuleSoft: '{sf_src}' (likely same asset)"
+            ),
+        ))
 
     for k in ai_only:
         rec = ai_keys[k]
