@@ -46,11 +46,24 @@ def _build_ready_query(limit: int, exclude_ids: set[str]) -> str:
     in Salesforce, so without this filter the poller would re-fetch the
     same cases on every cycle. The exclusion list comes from the local
     JobStore so we never re-process cases already in flight or completed.
+
+    Audit window — only process cases between MuleSoft completion and
+    analyst review:
+      - IDP_File_Process_Status__c = 'Processed' (MuleSoft done)
+      - IDP_Phase_1_Review__c = true             (Phase 1 ready)
+      - IDP_Process_Complete__c != null          (timestamp set)
+      - IDP_Meez_Review_Completed__c = null      (analyst hasn't reviewed)
+      - Final_Approval__c = null                 (case not finalized)
+    Without the last two filters, IDP would re-audit cases that humans
+    have already reviewed and closed — producing useless findings on
+    summary/cover-sheet PDFs uploaded after the original packet.
     """
     where_parts = [
         "IDP_File_Process_Status__c = 'Processed'",
         "IDP_Phase_1_Review__c = true",
         "IDP_Process_Complete__c != null",
+        "IDP_Meez_Review_Completed__c = null",
+        "Final_Approval__c = null",
     ]
     if exclude_ids:
         # Limit to a safe number of IDs per query — extra cases will be
