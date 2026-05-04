@@ -45,8 +45,9 @@ def _build_ready_query(limit: int) -> str:
     """Build the SOQL query for cases ready for IDP audit.
 
     Cases stay marked `IDP_File_Process_Status__c = 'Processed'` forever
-    in Salesforce. `IDP_Testing_Result__c = null` filters out cases that
-    have already been audited (set when findings are written back).
+    in Salesforce. `IDP_Testing_Results__c` (Long Text Area) holds the
+    findings IDP writes back; per-cycle dedup is handled by the local
+    JobStore since Long Text fields can't be filtered in SOQL.
 
     CertType__c filter — IDP is built for the four cert types in
     SUPPORTED_CERT_TYPES. Other values (e.g. "Certification Review",
@@ -58,6 +59,7 @@ def _build_ready_query(limit: int) -> str:
 SELECT Id, CaseNumber, CertType__c, Funding_Program2__c
 FROM Case
 WHERE IDP_File_Process_Status__c = 'Processed'
+  AND IDP_Meez_Review_Completed__c = null
   AND CertType__c IN ({cert_list})
 ORDER BY LastModifiedDate ASC
 LIMIT {limit}
@@ -141,9 +143,9 @@ def process_case(case_record: dict, settings: Settings) -> None:
 def poll_once(settings: Settings) -> int:
     """Run one polling cycle. Returns count of cases processed.
 
-    Dedup is handled at the SOQL level via IDP_Testing_Result__c = null.
-    Once findings are written to Salesforce, the case drops out of the
-    query automatically. No local state management needed for filtering.
+    Dedup is handled by the local JobStore (`is_already_processed`).
+    Salesforce's IDP_Testing_Results__c is Long Text Area and can't be
+    used in WHERE clauses, so we filter at the application level.
 
     The local JobStore is only used as defense-in-depth for multi-worker
     race conditions.

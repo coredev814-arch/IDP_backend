@@ -1,8 +1,13 @@
 """Webhook endpoints for the Salesforce → IDP audit pipeline.
 
-Two endpoints:
-  POST /webhook/pdf-attached   — Salesforce signals PDF attached to case.
-                                 IDP starts extraction in background.
+Recommended (single-webhook flow):
+  POST /webhook/audit-ready    — Salesforce signals MuleSoft is done.
+                                 IDP runs the full chain: download PDF,
+                                 extract, compare, write findings back.
+
+Legacy (2-webhook flow, kept for backward compat):
+  POST /webhook/pdf-attached   — Salesforce signals PDF attached.
+                                 IDP starts extraction.
   POST /webhook/mulesoft-done  — Salesforce signals MuleSoft completed.
                                  IDP runs comparison + builds findings.
 
@@ -23,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.core.config import Settings
 from app.core.dependencies import get_settings
 from app.services.audit.job_store import get_job_store
-from app.services.audit.jobs import run_comparison, run_extraction
+from app.services.audit.jobs import run_audit, run_comparison, run_extraction
 from app.services.audit.poller import SUPPORTED_CERT_TYPES
 
 logger = logging.getLogger(__name__)
@@ -133,6 +138,107 @@ class PdfAttachedPayload(BaseModel):
 class MuleSoftDonePayload(BaseModel):
     case_id: str
     case_number: str | None = None
+
+
+class AuditReadyPayload(BaseModel):
+    """Payload Salesforce sends when a case is ready for full IDP audit.
+
+    Fired AFTER MuleSoft has finished processing the PDF. IDP runs the
+    full chain (download -> extract -> compare -> writeback) on receipt.
+    Single-webhook design — replaces the older two-webhook flow.
+    """
+    case_id: str = Field(..., description="Salesforce Case Id (15- or 18-char)")
+    case_number: str | None = Field(
+        default=None,
+        description="Salesforce CaseNumber (e.g. CAS570309) — used in findings text",
+    )
+    cert_type: str = Field(
+        ...,
+        description=(
+            "Case.CertType__c — one of MI, AR, AR-SC, IR. Other values "
+            "(e.g. 'Certification Review', 'IC') are rejected with 422."
+        ),
+    )
+    funding_program: str = Field(
+        ..., description="Case.Funding_Program2__c — e.g. LIHTC, HUD, USDA",
+    )
+    content_document_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional ContentDocumentId of the PDF MuleSoft processed. "
+            "Strongly recommended — without it, IDP scans the case and "
+            "picks the most recent non-review PDF, which is best-effort."
+        ),
+    )
+
+    @field_validator("cert_type")
+    @classmethod
+    def _validate_cert_type(cls, v: str) -> str:
+        if v not in SUPPORTED_CERT_TYPES:
+            raise ValueError(
+                f"cert_type={v!r} is not supported by IDP. "
+                f"Allowed values: {sorted(SUPPORTED_CERT_TYPES)}"
+            )
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Audit-ready webhook (recommended, single-signal flow)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/webhook/audit-ready",
+    status_code=202,
+    dependencies=[Depends(_verify_webhook_mode), Depends(_verify_webhook_token)],
+)
+def audit_ready(
+    payload: AuditReadyPayload,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Salesforce → IDP: case is ready for full audit (MuleSoft done).
+
+    Runs the entire audit chain in the background:
+      1. Download PDF (via content_document_id if provided, else case scan)
+      2. Run IDP extraction
+      3. Pull MuleSoft data from Salesforce
+      4. Run AI-vs-MuleSoft comparison
+      5. Format findings
+      6. Write findings to Case.IDP_Testing_Results__c
+    """
+    logger.info(
+        "Webhook audit-ready: case=%s cert=%s funding=%s document=%s",
+        payload.case_number or payload.case_id,
+        payload.cert_type,
+        payload.funding_program,
+        payload.content_document_id,
+    )
+
+    store = get_job_store(settings.audit_job_db)
+    upsert = store.upsert_pending(
+        case_id=payload.case_id,
+        case_number=payload.case_number,
+        cert_type=payload.cert_type,
+        funding_program=payload.funding_program,
+        content_document_id=payload.content_document_id,
+    )
+
+    if upsert.get("deduplicated"):
+        return {
+            "status": "already_in_progress",
+            "case_id": payload.case_id,
+            "state": upsert.get("state"),
+        }
+
+    background_tasks.add_task(run_audit, payload.case_id)
+
+    return {
+        "status": "accepted",
+        "case_id": payload.case_id,
+        "case_number": payload.case_number,
+        "cert_type": payload.cert_type,
+        "funding_program": payload.funding_program,
+    }
 
 
 # ---------------------------------------------------------------------------

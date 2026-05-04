@@ -115,7 +115,35 @@ def run_extraction(case_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Comparison job (triggered by webhook 2: MuleSoft done)
+# Unified audit job (triggered by /webhook/audit-ready when MuleSoft is done)
+# ---------------------------------------------------------------------------
+
+def run_audit(case_id: str) -> None:
+    """End-to-end audit chain: extraction -> comparison -> writeback.
+
+    Used by the single-webhook design where the trigger fires after
+    MuleSoft finishes. We pre-mark mulesoft_done so run_extraction
+    auto-chains to run_comparison once extraction completes — no
+    separate signal, no racing logic, no waiting loop.
+
+    Caller must have already created the JobStore row via
+    upsert_pending() (the webhook handler does this).
+    """
+    settings = get_settings()
+    store = _store(settings)
+
+    # Setting mulesoft_done_at BEFORE extraction means the auto-chain at
+    # the end of run_extraction will fire run_comparison without needing
+    # a separate webhook 2 signal.
+    store.mark_mulesoft_done(case_id)
+
+    run_extraction(case_id)
+    # run_extraction sees mulesoft_done_at is set and calls run_comparison
+    # internally. run_comparison handles writeback. Nothing more to do.
+
+
+# ---------------------------------------------------------------------------
+# Comparison job (triggered by webhook 2: MuleSoft done — legacy 2-webhook flow)
 # ---------------------------------------------------------------------------
 
 def run_comparison(case_id: str) -> None:
@@ -210,13 +238,17 @@ def run_comparison(case_id: str) -> None:
             len(comparison.findings),
         )
 
-        # Salesforce writeback intentionally deferred. The findings text is
-        # available via the JobStore (state=done) and can be inspected via
-        # the GET /audit/cases/{case_id} endpoint or directly in SQLite.
-        logger.info(
-            "Findings (not yet pushed to Salesforce):\n%s\n%s\n%s",
-            "=" * 60, findings_text, "=" * 60,
-        )
+        # Push findings back to Salesforce (Case.IDP_Testing_Results__c).
+        # Local state is already DONE — writeback failure is logged but
+        # doesn't roll back the audit, since the findings are still
+        # retrievable via GET /audit/cases/{case_id}.
+        try:
+            sf.update_case_findings(case_id, findings_text)
+        except Exception:
+            logger.exception(
+                "Salesforce writeback failed for case %s — findings remain "
+                "in local JobStore (state=done) for inspection", case_id,
+            )
 
     except Exception as exc:
         logger.exception("Comparison failed for case %s", case_id)

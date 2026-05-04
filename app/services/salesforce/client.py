@@ -1,8 +1,7 @@
 """Salesforce REST/SOAP client for the IDP audit pipeline.
 
-Read-only for v1. Write methods (update_case_findings, mark_complete) are
-deliberately not implemented yet — the pipeline produces findings text but
-does not push it to Salesforce until that integration is approved.
+Reads case context, audit data, and PDF attachments. Writes audit findings
+back to the Case via update_case_findings (Long Text Area field).
 """
 import logging
 import threading
@@ -232,26 +231,106 @@ class SalesforceClient:
             f"Failed to download PDF {content_document_id} after 3 attempts"
         )
 
-    def get_pdf_for_case(self, case_id: str) -> tuple[bytes, str]:
-        """Find and download the most recent PDF attached to a Case.
+    # ------------------------------------------------------------------
+    # Write methods
+    # ------------------------------------------------------------------
 
-        Returns (pdf_bytes, content_document_id).
-        Falls back when the webhook doesn't include the document id directly.
+    # IDP_Testing_Results__c is a standard Long Text Area, max 32,768 chars.
+    # If a future case ever produces output longer than this we want a clear
+    # error rather than a silent Salesforce truncation, so we cap and warn.
+    _FINDINGS_FIELD_MAX_CHARS = 32_000
+
+    def update_case_findings(self, case_id: str, findings_text: str) -> None:
+        """Write the formatted audit findings to Case.IDP_Testing_Results__c."""
+        if len(findings_text) > self._FINDINGS_FIELD_MAX_CHARS:
+            logger.warning(
+                "Findings text for case %s is %d chars — truncating to %d "
+                "to fit IDP_Testing_Results__c Long Text Area limit",
+                case_id, len(findings_text), self._FINDINGS_FIELD_MAX_CHARS,
+            )
+            findings_text = (
+                findings_text[: self._FINDINGS_FIELD_MAX_CHARS - 200]
+                + "\n\n[TRUNCATED — see IDP logs for full findings]"
+            )
+
+        result = self.sf.Case.update(
+            case_id, {"IDP_Testing_Results__c": findings_text},
+        )
+        # simple_salesforce returns the HTTP status code (204 = success)
+        if isinstance(result, int) and result >= 400:
+            raise RuntimeError(
+                f"Salesforce update_case_findings returned {result} for {case_id}"
+            )
+        logger.info(
+            "Wrote findings (%d chars) to Case %s IDP_Testing_Results__c",
+            len(findings_text), case_id,
+        )
+
+    # Title patterns indicating a non-source document the IDP must NOT
+    # process: certification reviews, audit findings, review reports, etc.
+    # If a Case has multiple PDFs and one matches a denylist token, it's
+    # skipped so we land on the actual source packet instead.
+    _PDF_TITLE_DENYLIST = (
+        "certification review",
+        "review report",
+        "audit",
+        "findings",
+        "ai file audit",
+        "review notes",
+        "review comments",
+    )
+
+    def get_pdf_for_case(self, case_id: str) -> tuple[bytes, str]:
+        """Find and download the source PDF for a Case.
+
+        Strategy when content_document_id wasn't passed in the webhook:
+          1. Query ContentVersion (latest) joined to the case, filtered to
+             FileExtension='pdf' so non-PDF attachments don't waste cycles.
+          2. Order by CreatedDate DESC — the file MuleSoft just processed
+             is overwhelmingly the newest one.
+          3. Skip titles matching the denylist (certification reviews,
+             audit reports, etc.) since those aren't source packets.
+          4. Download the first survivor.
+
+        This is best-effort; the only authoritative way is for Salesforce
+        to include content_document_id in the webhook payload.
         """
         case_id_s = _escape_soql(case_id)
         links = self.sf.query(f"""
-            SELECT ContentDocumentId
+            SELECT ContentDocumentId, ContentDocument.Title,
+                   ContentDocument.FileExtension,
+                   ContentDocument.CreatedDate
             FROM ContentDocumentLink
             WHERE LinkedEntityId = '{case_id_s}'
+              AND ContentDocument.FileExtension = 'pdf'
+            ORDER BY ContentDocument.CreatedDate DESC
         """).get("records", [])
 
+        skipped_titles: list[str] = []
         for link in links:
+            cd = link.get("ContentDocument") or {}
+            title = (cd.get("Title") or "").lower()
             cd_id = link["ContentDocumentId"]
-            try:
-                pdf_bytes = self.download_pdf(cd_id)
-                return pdf_bytes, cd_id
-            except ValueError:
-                # Not a PDF — try next attachment
+
+            if any(token in title for token in self._PDF_TITLE_DENYLIST):
+                skipped_titles.append(cd.get("Title") or cd_id)
                 continue
 
-        raise ValueError(f"No PDF attachment found for case {case_id}")
+            try:
+                pdf_bytes = self.download_pdf(cd_id)
+                if skipped_titles:
+                    logger.info(
+                        "Picked PDF '%s' for case %s; skipped non-source: %s",
+                        cd.get("Title"), case_id, skipped_titles,
+                    )
+                return pdf_bytes, cd_id
+            except ValueError:
+                # Defensive — the SOQL filter should have already excluded
+                # non-PDFs, but ContentVersion.FileExtension can drift from
+                # ContentDocument.FileExtension in rare edge cases.
+                continue
+
+        raise ValueError(
+            f"No source PDF attachment found for case {case_id} "
+            f"(skipped {len(skipped_titles)} review/audit document(s))"
+        )

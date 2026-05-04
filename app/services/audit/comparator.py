@@ -242,6 +242,82 @@ def _account_types_compatible(a: str | None, b: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cluster helpers — collapse variant spellings into one finding so analysts
+# don't see "AI missed walmart" + "AI missed wal-mart" + "AI missed walmart inc"
+# as three findings when MuleSoft is just storing the same employer 3 ways.
+# ---------------------------------------------------------------------------
+
+def _cluster_income_keys(
+    keys: set[tuple[str, str]],
+    threshold: float = 0.85,
+) -> list[list[tuple[str, str]]]:
+    """Group (source, member) tuples whose source names are near-identical
+    after org-name normalization. Same member required to cluster — different
+    members keep their findings separate.
+    Empty source names are dropped (they produce useless findings).
+    """
+    clusters: list[list[tuple[str, str]]] = []
+    for k in keys:
+        if not k[0]:
+            continue
+        norm = _normalize_org_name(k[0])
+        attached = False
+        for cluster in clusters:
+            rep = cluster[0]
+            if rep[1] != k[1]:
+                continue
+            if _name_similarity(norm, _normalize_org_name(rep[0])) >= threshold:
+                cluster.append(k)
+                attached = True
+                break
+        if not attached:
+            clusters.append([k])
+    return clusters
+
+
+def _cluster_asset_keys(
+    keys: set[tuple[str, str, str]],
+    threshold: float = 0.85,
+) -> list[list[tuple[str, str, str]]]:
+    """Group asset keys that look like the same real-world account.
+
+    Two keys cluster when accountTypes are compatible AND either:
+      - both have a real (non-stub) last4 that matches, OR
+      - source names fuzzy-match after org-name normalization.
+    Keys with no source AND no real last4 are dropped.
+    """
+    clusters: list[list[tuple[str, str, str]]] = []
+    for k in keys:
+        src, atype, last4 = k
+        is_stub = (not last4) or last4.startswith("~")
+        if not src and is_stub:
+            continue
+        attached = False
+        for cluster in clusters:
+            rep_src, rep_type, rep_last4 = cluster[0]
+            if not _account_types_compatible(atype, rep_type):
+                continue
+            rep_stub = (not rep_last4) or rep_last4.startswith("~")
+            # Strong: matching real account numbers
+            if not is_stub and not rep_stub and last4 == rep_last4:
+                cluster.append(k)
+                attached = True
+                break
+            # Fall back to source-name similarity
+            if src and rep_src:
+                if _name_similarity(
+                    _normalize_org_name(src),
+                    _normalize_org_name(rep_src),
+                ) >= threshold:
+                    cluster.append(k)
+                    attached = True
+                    break
+        if not attached:
+            clusters.append([k])
+    return clusters
+
+
+# ---------------------------------------------------------------------------
 # Member comparison
 # ---------------------------------------------------------------------------
 
@@ -567,25 +643,42 @@ def _compare_income(
                 ),
             ))
 
-    for k in ai_only:
+    # AI-only — drop empty source names (useless finding "MuleSoft missing ''")
+    ai_only_clean = {k for k in ai_only if k[0]}
+    for k in ai_only_clean:
         findings.append(Finding(
             category=MISSING_INCOME,
             severity="high",
             message=f"MuleSoft missing income source — '{k[0]}' for {k[1] or 'household'}",
         ))
 
-    for k in sf_only:
+    # SF-only — cluster variant spellings ('walmart' / 'wal-mart' / 'walmart inc')
+    # so MuleSoft's same-source-many-rows shows as one finding, not many.
+    sf_only_clusters = _cluster_income_keys(sf_only)
+    for cluster in sf_only_clusters:
+        rep = cluster[0]
+        member = rep[1] or "household"
+        if len(cluster) > 1:
+            variants = ", ".join(f"'{k[0]}'" for k in cluster[:3])
+            if len(cluster) > 3:
+                variants += f", +{len(cluster) - 3} more"
+            msg = (
+                f"AI may have missed income source — '{rep[0]}' for {member} "
+                f"(MuleSoft has {len(cluster)} variant spellings: {variants})"
+            )
+        else:
+            msg = f"AI may have missed income source — '{rep[0]}' for {member}"
         findings.append(Finding(
             category=IDP_MISSED_INCOME,
             severity="medium",
-            message=f"AI may have missed income source — '{k[0]}' is in MuleSoft",
+            message=msg,
         ))
 
     return findings, {
         "agreements": agreements,
         "disagreements": disagreements,
-        "ai_only": len(ai_only),
-        "sf_only": len(sf_only),
+        "ai_only": len(ai_only_clean),
+        "sf_only": len(sf_only_clusters),
     }
 
 
@@ -796,7 +889,9 @@ def _compare_assets(
                 message=name_msg,
             ))
 
-    for k in ai_only:
+    # AI-only — drop entries with no identifying name (useless finding)
+    ai_only_clean = {k for k in ai_only if (k[0] or k[2])}
+    for k in ai_only_clean:
         rec = ai_keys[k]
         findings.append(Finding(
             category=MISSING_ASSET,
@@ -807,21 +902,38 @@ def _compare_assets(
             ),
         ))
 
-    for k in sf_only:
+    # SF-only — cluster keys that look like the same real account under
+    # different name variants (e.g. 'BOA - Checking 2390' / 'BOA CK# 2390').
+    sf_only_clusters = _cluster_asset_keys(sf_only)
+    for cluster in sf_only_clusters:
+        rep_key = cluster[0]
+        rep_rec = sf_keys[rep_key][0]
+        if len(cluster) > 1:
+            variants = ", ".join(
+                f"'{sf_keys[k][0].get('Source_Name__c')}'" for k in cluster[:3]
+            )
+            if len(cluster) > 3:
+                variants += f", +{len(cluster) - 3} more"
+            msg = (
+                f"AI may have missed asset — '{rep_rec.get('Source_Name__c')}' "
+                f"is in MuleSoft ({len(cluster)} variant spellings: {variants})"
+            )
+        else:
+            msg = (
+                f"AI may have missed asset — '{rep_rec.get('Source_Name__c')}' "
+                f"is in MuleSoft"
+            )
         findings.append(Finding(
             category=IDP_MISSED_ASSET,
             severity="medium",
-            message=(
-                f"AI may have missed asset — '{sf_keys[k][0].get('Source_Name__c')}' "
-                f"is in MuleSoft"
-            ),
+            message=msg,
         ))
 
     return findings, {
         "agreements": agreements,
         "disagreements": disagreements,
-        "ai_only": len(ai_only),
-        "sf_only": len(sf_only),
+        "ai_only": len(ai_only_clean),
+        "sf_only": len(sf_only_clusters),
     }
 
 
