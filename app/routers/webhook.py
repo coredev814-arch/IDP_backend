@@ -18,12 +18,13 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.config import Settings
 from app.core.dependencies import get_settings
 from app.services.audit.job_store import get_job_store
 from app.services.audit.jobs import run_comparison, run_extraction
+from app.services.audit.poller import SUPPORTED_CERT_TYPES
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,8 +99,9 @@ class PdfAttachedPayload(BaseModel):
     cert_type: str = Field(
         ...,
         description=(
-            "Case.CertType__c — one of MI, IC, AR, AR-SC, IR. Drives the "
-            "extraction prompts and compliance rules."
+            "Case.CertType__c — one of MI, AR, AR-SC, IR. Drives the "
+            "extraction prompts and compliance rules. Other values "
+            "(e.g. 'Certification Review', 'IC') are rejected with 422."
         ),
     )
     funding_program: str = Field(
@@ -116,6 +118,16 @@ class PdfAttachedPayload(BaseModel):
             "the IDP will scan the case for the most recent PDF."
         ),
     )
+
+    @field_validator("cert_type")
+    @classmethod
+    def _validate_cert_type(cls, v: str) -> str:
+        if v not in SUPPORTED_CERT_TYPES:
+            raise ValueError(
+                f"cert_type={v!r} is not supported by IDP. "
+                f"Allowed values: {sorted(SUPPORTED_CERT_TYPES)}"
+            )
+        return v
 
 
 class MuleSoftDonePayload(BaseModel):
