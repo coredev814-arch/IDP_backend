@@ -60,7 +60,6 @@ SELECT Id, CaseNumber, CertType__c, Funding_Program2__c
 FROM Case
 WHERE IDP_File_Process_Status__c = 'Processed'
   AND IDP_Meez_Review_Completed__c = null
-  AND CertType__c IN ({cert_list})
 ORDER BY LastModifiedDate ASC
 LIMIT {limit}
 """.strip()
