@@ -424,13 +424,15 @@ def _compare_income(
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
 
-    # Build map of AI annual amounts by source
+    # Build map of AI annual amounts by source. Use _income_key so the
+    # keys go through the same synonym normalization as ai_keys / sf_keys —
+    # otherwise "SSA" (raw) won't find "social security administration"
+    # (synonym-applied) when looking up a matched record.
     ai_annual: dict[tuple[str, str], float] = {}
     for calc in ai_calculations or []:
-        k = (_norm(calc.get("sourceName")), _norm(calc.get("memberName")))
         amt = _money(calc.get("annualIncome"))
         if amt is not None:
-            ai_annual[k] = amt
+            ai_annual[_income_key(calc)] = amt
 
     # SF dedup check
     sf_keys: dict[tuple, list[dict]] = {}
@@ -524,18 +526,46 @@ def _compare_income(
         else:
             agreements += 1     # both present, can't compare values
 
-    # Surface fuzzy-matched income sources as low-severity name variants.
-    # Treat as agreements for confidence scoring (both systems have it).
+    # Surface fuzzy-matched income sources. If the dollar amounts also
+    # differ, escalate to INCOME MISMATCH (medium) — name variants must
+    # NOT hide real discrepancies. Otherwise emit the low-severity name
+    # variant note. Mirrors the asset-side pattern.
     for ai_k, sf_k in fuzzy_pairs:
-        agreements += 1
-        findings.append(Finding(
-            category=VALUE_MISMATCH,
-            severity="low",
-            message=(
-                f"Income source name variant — AI: '{ai_k[0]}' vs "
-                f"MuleSoft: '{sf_k[0]}' (likely same source)"
-            ),
-        ))
+        sf_rec = sf_keys[sf_k][0]
+        ai_amt = ai_annual.get(ai_k)
+        sf_amt = _money(sf_rec.get("Gross_Member_Income__c"))
+        amount_diff = (
+            ai_amt is not None and sf_amt is not None and sf_amt > 0
+            and not _close(ai_amt, sf_amt, tolerance=0.01)
+        )
+
+        if amount_diff:
+            disagreements += 1
+            findings.append(Finding(
+                category=VALUE_MISMATCH,
+                severity="medium",
+                message=(
+                    f"INCOME MISMATCH — '{sf_rec.get('Source_Name__c')}' "
+                    f"(matched to AI '{ai_k[0]}'): "
+                    f"AI ${ai_amt:,.2f} vs MuleSoft ${sf_amt:,.2f}"
+                ),
+                detail={
+                    "source": sf_rec.get("Source_Name__c"),
+                    "ai_source": ai_k[0],
+                    "ai_amount": ai_amt,
+                    "sf_amount": sf_amt,
+                },
+            ))
+        else:
+            agreements += 1
+            findings.append(Finding(
+                category=VALUE_MISMATCH,
+                severity="low",
+                message=(
+                    f"Income source name variant — AI: '{ai_k[0]}' vs "
+                    f"MuleSoft: '{sf_k[0]}' (likely same source)"
+                ),
+            ))
 
     for k in ai_only:
         findings.append(Finding(

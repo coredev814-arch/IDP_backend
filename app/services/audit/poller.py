@@ -34,63 +34,41 @@ from app.services.salesforce.client import _escape_soql, get_salesforce_client
 logger = logging.getLogger(__name__)
 
 
-# SOQL `IN` clauses are limited (default ~4 KB query length, practical
-# safe ceiling ~200 IDs). We chunk the exclusion list if it grows beyond.
-_MAX_EXCLUDE_IDS_PER_QUERY = 200
+# IDP only audits these cert types. Anything else on Case.CertType__c —
+# blank stubs, "Certification Review", "IC", and any future values — is
+# out of scope and must NOT enter the audit pipeline. Filtered at SOQL
+# level (poll mode) and validated at the webhook (push mode).
+SUPPORTED_CERT_TYPES: frozenset[str] = frozenset({"MI", "AR", "AR-SC", "IR"})
 
 
-def _build_ready_query(limit: int, exclude_ids: set[str]) -> str:
-    """Build the SOQL query, excluding already-known case IDs.
+def _build_ready_query(limit: int) -> str:
+    """Build the SOQL query for cases ready for IDP audit.
 
     Cases stay marked `IDP_File_Process_Status__c = 'Processed'` forever
-    in Salesforce, so without this filter the poller would re-fetch the
-    same cases on every cycle. The exclusion list comes from the local
-    JobStore so we never re-process cases already in flight or completed.
+    in Salesforce. `IDP_Testing_Result__c = null` filters out cases that
+    have already been audited (set when findings are written back).
 
-    Audit window — only process cases between MuleSoft completion and
-    analyst review:
-      - IDP_File_Process_Status__c = 'Processed' (MuleSoft done)
-      - IDP_Phase_1_Review__c = true             (Phase 1 ready)
-      - IDP_Process_Complete__c != null          (timestamp set)
-      - IDP_Meez_Review_Completed__c = null      (analyst hasn't reviewed)
-      - Final_Approval__c = null                 (case not finalized)
-    Without the last two filters, IDP would re-audit cases that humans
-    have already reviewed and closed — producing useless findings on
-    summary/cover-sheet PDFs uploaded after the original packet.
+    CertType__c filter — IDP is built for the four cert types in
+    SUPPORTED_CERT_TYPES. Other values (e.g. "Certification Review",
+    "IC") have different document expectations and would produce
+    nonsense findings. Filtered here so they never reach the pipeline.
     """
-    where_parts = [
-        "IDP_File_Process_Status__c = 'Processed'",
-        "IDP_Phase_1_Review__c = true",
-        "IDP_Process_Complete__c != null",
-        "IDP_Meez_Review_Completed__c = null",
-        "Final_Approval__c = null",
-    ]
-    if exclude_ids:
-        # Limit to a safe number of IDs per query — extra cases will be
-        # caught on subsequent poll cycles as the exclusion list shrinks.
-        ids_subset = list(exclude_ids)[:_MAX_EXCLUDE_IDS_PER_QUERY]
-        ids_str = ", ".join(f"'{_escape_soql(i)}'" for i in ids_subset)
-        where_parts.append(f"Id NOT IN ({ids_str})")
-
-    where_clause = "\n  AND ".join(where_parts)
+    cert_list = ", ".join(f"'{ct}'" for ct in sorted(SUPPORTED_CERT_TYPES))
     return f"""
 SELECT Id, CaseNumber, CertType__c, Funding_Program2__c
 FROM Case
-WHERE {where_clause}
-ORDER BY IDP_Process_Complete__c ASC
+WHERE IDP_File_Process_Status__c = 'Processed'
+  AND IDP_Testing_Result__c = null
+  AND CertType__c IN ({cert_list})
+ORDER BY LastModifiedDate ASC
 LIMIT {limit}
 """.strip()
 
 
-def fetch_ready_cases(
-    settings: Settings,
-    limit: int,
-    exclude_ids: set[str] | None = None,
-) -> list[dict]:
-    """Query Salesforce for ready cases, excluding already-known IDs."""
+def fetch_ready_cases(settings: Settings, limit: int) -> list[dict]:
+    """Query Salesforce for cases ready for IDP audit."""
     sf = get_salesforce_client(settings)
-    query = _build_ready_query(limit, exclude_ids or set())
-    result = sf.sf.query(query)
+    result = sf.sf.query(_build_ready_query(limit))
     return result.get("records", [])
 
 
@@ -115,24 +93,14 @@ def process_case(case_record: dict, settings: Settings) -> None:
     cert_type = case_record.get("CertType__c")
     funding = case_record.get("Funding_Program2__c")
 
-    # Cases without a CertType__c are usually stubs or non-cert work items
-    # that shouldn't be audited. Mark as failed so we don't keep retrying.
-    if not cert_type:
-        logger.warning(
-            "Skipping case=%s — CertType__c is missing on the Case record. "
-            "Polling SOQL should typically exclude these; flagging as failed.",
-            case_number or case_id,
-        )
-        store = get_job_store(settings.audit_job_db)
-        store.upsert_pending(
-            case_id=case_id,
-            case_number=case_number,
-            cert_type=None,
-            funding_program=None,
-            content_document_id=None,
-        )
-        store.mark_extraction_failed(
-            case_id, "CertType__c missing — case not eligible for audit",
+    # CertType__c gating — only audit MI / AR / AR-SC / IR cases. Anything
+    # else (missing, "Certification Review", "IC", etc.) is out of scope.
+    # The poller's SOQL filter handles the common case; this branch is
+    # defense-in-depth for SOQL drift or direct calls bypassing the poller.
+    if cert_type not in SUPPORTED_CERT_TYPES:
+        logger.info(
+            "Skipping case=%s — CertType__c=%r not in supported set %s",
+            case_number or case_id, cert_type, sorted(SUPPORTED_CERT_TYPES),
         )
         return
 
@@ -174,30 +142,21 @@ def process_case(case_record: dict, settings: Settings) -> None:
 def poll_once(settings: Settings) -> int:
     """Run one polling cycle. Returns count of cases processed.
 
-    Builds the exclusion list from the local JobStore — already-known
-    case IDs (in any state except failed) are filtered out at the SOQL
-    level so we don't waste API calls on cases we've already handled.
+    Dedup is handled at the SOQL level via IDP_Testing_Result__c = null.
+    Once findings are written to Salesforce, the case drops out of the
+    query automatically. No local state management needed for filtering.
 
-    Failed cases (extraction/comparison/timeout) are NOT excluded — they
-    get retried on the next poll cycle.
+    The local JobStore is only used as defense-in-depth for multi-worker
+    race conditions.
     """
-    store = get_job_store(settings.audit_job_db)
-    known = store.list_known_case_ids()
-    failed = store.list_failed_case_ids()
-    exclude_ids = known - failed   # exclude all known except failed (retry those)
-
     cases = fetch_ready_cases(
         settings,
         settings.audit_poll_batch_size,
-        exclude_ids=exclude_ids,
     )
     if not cases:
         return 0
 
-    logger.info(
-        "Poll cycle: fetched %d ready case(s) (excluded %d known IDs, %d failed eligible for retry)",
-        len(cases), len(exclude_ids), len(failed),
-    )
+    logger.info("Poll cycle: fetched %d ready case(s)", len(cases))
 
     processed = 0
     for case in cases:
