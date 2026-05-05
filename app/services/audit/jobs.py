@@ -238,6 +238,14 @@ def run_comparison(case_id: str) -> None:
             len(comparison.findings),
         )
 
+        # Print the full findings to the console for the rollout window —
+        # makes it easy to inspect output without opening Salesforce or
+        # hitting the GET endpoint. Remove once the integration is stable.
+        logger.info(
+            "Findings for case %s:\n%s\n%s\n%s",
+            case_number, "=" * 60, findings_text, "=" * 60,
+        )
+
         # Push findings back to Salesforce (Case.IDP_Testing_Results__c).
         # Local state is already DONE — writeback failure is logged but
         # doesn't roll back the audit, since the findings are still
