@@ -268,6 +268,47 @@ class JobStore:
             """, (EXTRACTION_FAILED, COMPARISON_FAILED, MULESOFT_TIMEOUT)).fetchall()
             return {r["case_id"] for r in rows}
 
+    # ------------------------------------------------------------------
+    # Admin / maintenance
+    # ------------------------------------------------------------------
+
+    def delete_by_state(self, state: str) -> int:
+        """Delete all rows in the given state. Returns rowcount.
+
+        Used by the admin reset endpoint to re-queue completed audits
+        without wiping in-flight work.
+        """
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM audit_jobs WHERE state = ?", (state,),
+            )
+            return cur.rowcount
+
+    def delete_by_case_ids(self, case_ids: list[str]) -> int:
+        """Delete rows for specific case IDs. Returns rowcount.
+
+        SQLite has a 999-param ceiling for IN clauses; we chunk to be safe.
+        """
+        if not case_ids:
+            return 0
+        total = 0
+        with self._lock, self._connect() as conn:
+            for i in range(0, len(case_ids), 500):
+                chunk = case_ids[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cur = conn.execute(
+                    f"DELETE FROM audit_jobs WHERE case_id IN ({placeholders})",
+                    chunk,
+                )
+                total += cur.rowcount
+        return total
+
+    def delete_all(self) -> int:
+        """Delete every row. Returns rowcount. Nuclear option."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM audit_jobs")
+            return cur.rowcount
+
 
 _SINGLETON: JobStore | None = None
 _SINGLETON_LOCK = threading.Lock()

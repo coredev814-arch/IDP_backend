@@ -241,7 +241,11 @@ class SalesforceClient:
     _FINDINGS_FIELD_MAX_CHARS = 32_000
 
     def update_case_findings(self, case_id: str, findings_text: str) -> None:
-        """Write the formatted audit findings to Case.IDP_Testing_Results__c."""
+        """Write findings to Case.IDP_Testing_Results__c and flip
+        IDP_Audit_Complete__c to True. One Salesforce call so both fields
+        land atomically — important because the poller's SOQL filters on
+        IDP_Audit_Complete__c=False to skip already-audited cases.
+        """
         if len(findings_text) > self._FINDINGS_FIELD_MAX_CHARS:
             logger.warning(
                 "Findings text for case %s is %d chars — truncating to %d "
@@ -253,16 +257,17 @@ class SalesforceClient:
                 + "\n\n[TRUNCATED — see IDP logs for full findings]"
             )
 
-        result = self.sf.Case.update(
-            case_id, {"IDP_Testing_Results__c": findings_text},
-        )
+        result = self.sf.Case.update(case_id, {
+            "IDP_Testing_Results__c": findings_text,
+            "IDP_Audit_Complete__c": True,
+        })
         # simple_salesforce returns the HTTP status code (204 = success)
         if isinstance(result, int) and result >= 400:
             raise RuntimeError(
                 f"Salesforce update_case_findings returned {result} for {case_id}"
             )
         logger.info(
-            "Wrote findings (%d chars) to Case %s IDP_Testing_Results__c",
+            "Wrote findings (%d chars) and set IDP_Audit_Complete=true on Case %s",
             len(findings_text), case_id,
         )
 

@@ -357,3 +357,70 @@ def get_case_audit(
     # Don't return the full extraction blob in this endpoint — too large.
     job.pop("extraction_result", None)
     return job
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoint: clear JobStore rows so cases can be re-audited
+# ---------------------------------------------------------------------------
+
+class ResetJobsPayload(BaseModel):
+    """Reset payload for /admin/audit-jobs/reset.
+
+    Three modes — pick the smallest blast radius that solves your problem:
+      - "done"   : delete only completed audits (typical case for re-running
+                   after a comparator/formatter change).
+      - "by_ids" : delete specific case IDs.
+      - "all"    : delete every row. Use with caution — wipes in-flight work.
+    """
+    mode: str = Field(..., description="'done' | 'by_ids' | 'all'")
+    case_ids: list[str] | None = Field(
+        default=None,
+        description="Required when mode='by_ids', ignored otherwise",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, v: str) -> str:
+        if v not in ("done", "by_ids", "all"):
+            raise ValueError(f"mode must be one of 'done', 'by_ids', 'all'; got {v!r}")
+        return v
+
+
+@router.post(
+    "/admin/audit-jobs/reset",
+    dependencies=[Depends(_verify_webhook_token)],
+)
+def reset_audit_jobs(
+    payload: ResetJobsPayload,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Clear JobStore rows so cases re-enter the queue on next poll/webhook.
+
+    Authenticated with the same bearer token as webhooks. Works regardless
+    of audit_mode (poll vs webhook), since this is a maintenance op.
+    """
+    store = get_job_store(settings.audit_job_db)
+
+    if payload.mode == "done":
+        deleted = store.delete_by_state("done")
+        logger.warning("Admin reset: deleted %d DONE jobs", deleted)
+        return {"deleted": deleted, "mode": "done"}
+
+    if payload.mode == "by_ids":
+        ids = payload.case_ids or []
+        if not ids:
+            raise HTTPException(
+                status_code=400,
+                detail="case_ids is required when mode='by_ids'",
+            )
+        deleted = store.delete_by_case_ids(ids)
+        logger.warning(
+            "Admin reset: deleted %d job(s) by case_id (requested %d)",
+            deleted, len(ids),
+        )
+        return {"deleted": deleted, "mode": "by_ids", "requested": len(ids)}
+
+    # mode == "all"
+    deleted = store.delete_all()
+    logger.warning("Admin reset: WIPED %d jobs (mode=all)", deleted)
+    return {"deleted": deleted, "mode": "all"}

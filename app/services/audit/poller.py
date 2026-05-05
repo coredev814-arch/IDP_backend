@@ -44,22 +44,27 @@ SUPPORTED_CERT_TYPES: frozenset[str] = frozenset({"MI", "AR", "AR-SC", "IR"})
 def _build_ready_query(limit: int) -> str:
     """Build the SOQL query for cases ready for IDP audit.
 
-    Cases stay marked `IDP_File_Process_Status__c = 'Processed'` forever
-    in Salesforce. `IDP_Testing_Results__c` (Long Text Area) holds the
-    findings IDP writes back; per-cycle dedup is handled by the local
-    JobStore since Long Text fields can't be filtered in SOQL.
+    Salesforce-side flow (per Scott):
+      Status = 'Certification Approval'
+        -> creates Certification_Review__c, sets IDP_File_Process_Status__c
+           = 'Ready to Process' (calls MuleSoft)
+      MuleSoft returns
+        -> Meez_Review_Status__c = 'Ready for Review'
+        -> 5-min cooldown via IDP_Review_Clean_Up_Time__c
+        -> IDP_Phase_1_Review__c = TRUE   <<< definitive 'audit ready'
 
-    CertType__c filter — IDP is built for the four cert types in
-    SUPPORTED_CERT_TYPES. Other values (e.g. "Certification Review",
-    "IC") have different document expectations and would produce
-    nonsense findings. Filtered here so they never reach the pipeline.
+    So `IDP_Phase_1_Review__c = TRUE` is the right entry signal — by then
+    MuleSoft has settled. `IDP_Audit_Complete__c = FALSE` excludes cases
+    we've already written findings for (set by writeback). CertType__c
+    filter limits to the 4 supported cert types.
     """
     cert_list = ", ".join(f"'{ct}'" for ct in sorted(SUPPORTED_CERT_TYPES))
     return f"""
 SELECT Id, CaseNumber, CertType__c, Funding_Program2__c
 FROM Case
-WHERE IDP_File_Process_Status__c = 'Processed'
-  AND IDP_Meez_Review_Completed__c = null
+WHERE IDP_Phase_1_Review__c = TRUE
+  AND IDP_Audit_Complete__c = FALSE
+  AND CertType__c IN ({cert_list})
 ORDER BY LastModifiedDate ASC
 LIMIT {limit}
 """.strip()
