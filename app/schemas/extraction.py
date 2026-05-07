@@ -85,6 +85,16 @@ class CertificationInfo(BaseModel):
     missingForms: list[str] = []
     complianceStatus: Optional[str] = None  # Complete, Incomplete, Pending Review
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v):
+        # LLMs sometimes return floats for money/numeric fields (e.g.
+        # grossRent=72.0). Schema expects strings — coerce before validation.
+        # Skips list/dict so list[str] fields and nested objects work.
+        if v is not None and not isinstance(v, (str, dict, list)):
+            return str(v)
+        return v
+
 
 # ---------------------------------------------------------------------------
 # MuleSoft Schema — Income Extraction V4.3 (Section 21)
@@ -266,6 +276,13 @@ class PreviousCertIncomeSource(BaseModel):
     memberName: Optional[str] = None
     annualAmount: Optional[str] = None
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v):
+        if v is not None and not isinstance(v, (str, dict, list)):
+            return str(v)
+        return v
+
 
 class PreviousCertification(BaseModel):
     """Previous certification data for IR delta comparison."""
@@ -278,6 +295,19 @@ class PreviousCertification(BaseModel):
     householdSize: Optional[str] = None
     income_by_source: list[PreviousCertIncomeSource] = []
     source_pages: list[int] = []
+
+    @field_validator(
+        "effectiveDate", "certificationType", "householdIncome",
+        "tenantRent", "grossRent", "utilityAllowance", "householdSize",
+        mode="before",
+    )
+    @classmethod
+    def coerce_str_fields(cls, v):
+        # source_pages is list[int] and must NOT be coerced — only the
+        # string-shaped fields here.
+        if v is not None and not isinstance(v, (str, dict, list)):
+            return str(v)
+        return v
 
 
 class ExtractionResult(BaseModel):
