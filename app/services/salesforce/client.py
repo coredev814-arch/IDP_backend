@@ -240,6 +240,24 @@ class SalesforceClient:
     # error rather than a silent Salesforce truncation, so we cap and warn.
     _FINDINGS_FIELD_MAX_CHARS = 32_000
 
+    def get_case_findings(self, case_id: str) -> dict[str, Any] | None:
+        """Read the previously-written findings + complete flag from a Case.
+
+        Used by the audit read endpoint to surface results for cases that
+        were finished and removed from the local JobStore.
+        Returns None if the case isn't found.
+        """
+        case_id_s = _escape_soql(case_id)
+        result = self.sf.query(f"""
+            SELECT Id, CaseNumber, CertType__c, Funding_Program2__c,
+                   IDP_Testing_Results__c, IDP_Audit_Complete__c
+            FROM Case
+            WHERE Id = '{case_id_s}'
+        """).get("records", [])
+        if not result:
+            return None
+        return result[0]
+
     def update_case_findings(self, case_id: str, findings_text: str) -> None:
         """Write findings to Case.IDP_Testing_Results__c and flip
         IDP_Audit_Complete__c to True. One Salesforce call so both fields

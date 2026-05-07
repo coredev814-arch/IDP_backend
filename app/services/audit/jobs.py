@@ -37,6 +37,58 @@ def _store(settings: Settings) -> JobStore:
     return get_job_store(settings.audit_job_db)
 
 
+def _format_failure_marker(case_number: str, stage: str, error: str) -> str:
+    """Render a clear failure message that gets written to
+    IDP_Testing_Results__c when an audit can't complete. Salesforce sees
+    a real entry instead of an empty field; the case drops out of the
+    poller's SOQL once IDP_Audit_Complete__c flips to TRUE.
+    """
+    return (
+        "--- AI FILE AUDIT FAILED ---\n"
+        f"Case: {case_number}\n"
+        f"Processed: {date.today().isoformat()}\n"
+        f"Stage: {stage}\n"
+        f"Error: {error}\n"
+        "\n"
+        "The audit could not be completed automatically. "
+        "Manual review required."
+    )
+
+
+def _finalize_case(
+    case_id: str,
+    case_number: str,
+    settings: Settings,
+    text_for_salesforce: str,
+) -> None:
+    """Write outcome to Salesforce, then drop the local JobStore row.
+
+    Used by both success and failure paths — JobStore is a transient queue
+    only; Salesforce is the canonical archive.
+
+    If Salesforce write fails, we leave the local row in place so the
+    operator can investigate via GET /audit/cases/{case_id}. The next poll
+    cycle won't reprocess (the row is in a non-restartable state).
+    """
+    store = _store(settings)
+    try:
+        sf = get_salesforce_client(settings)
+        sf.update_case_findings(case_id, text_for_salesforce)
+    except Exception:
+        logger.exception(
+            "Salesforce writeback failed for case %s — local JobStore row "
+            "kept for inspection (state remains terminal, no auto-retry)",
+            case_id,
+        )
+        return
+
+    deleted = store.delete_by_case_ids([case_id])
+    logger.info(
+        "Cleaned up JobStore for case=%s (deleted %d row)",
+        case_number, deleted,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Extraction job (triggered by webhook 1: PDF attached)
 # ---------------------------------------------------------------------------
@@ -111,7 +163,18 @@ def run_extraction(case_id: str) -> None:
 
     except Exception as exc:
         logger.exception("Extraction failed for case %s", case_id)
-        store.mark_extraction_failed(case_id, f"{type(exc).__name__}: {exc}")
+        error_str = f"{type(exc).__name__}: {exc}"
+        store.mark_extraction_failed(case_id, error_str)
+        # Write the failure marker to Salesforce so the case drops out of
+        # the SOQL on next poll. Then drop the local row — JobStore is a
+        # transient queue, not an archive.
+        case_number = (job.get("case_number") if job else None) or case_id
+        _finalize_case(
+            case_id, case_number, settings,
+            text_for_salesforce=_format_failure_marker(
+                case_number, "extraction", error_str,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -246,18 +309,22 @@ def run_comparison(case_id: str) -> None:
             case_number, "=" * 60, findings_text, "=" * 60,
         )
 
-        # Push findings back to Salesforce (Case.IDP_Testing_Results__c).
-        # Local state is already DONE — writeback failure is logged but
-        # doesn't roll back the audit, since the findings are still
-        # retrievable via GET /audit/cases/{case_id}.
-        try:
-            sf.update_case_findings(case_id, findings_text)
-        except Exception:
-            logger.exception(
-                "Salesforce writeback failed for case %s — findings remain "
-                "in local JobStore (state=done) for inspection", case_id,
-            )
+        # Push findings to Salesforce, then delete the local row.
+        # JobStore = transient queue; Salesforce = canonical archive.
+        # _finalize_case logs and bails out cleanly if Salesforce write fails.
+        _finalize_case(
+            case_id, case_number, settings,
+            text_for_salesforce=findings_text,
+        )
 
     except Exception as exc:
         logger.exception("Comparison failed for case %s", case_id)
-        store.mark_comparison_failed(case_id, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        error_str = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        store.mark_comparison_failed(case_id, error_str)
+        case_number = (job.get("case_number") if job else None) or case_id
+        _finalize_case(
+            case_id, case_number, settings,
+            text_for_salesforce=_format_failure_marker(
+                case_number, "comparison", f"{type(exc).__name__}: {exc}",
+            ),
+        )

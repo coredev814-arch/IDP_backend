@@ -247,6 +247,50 @@ class JobStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def list_all(
+        self,
+        state: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List jobs with optional state filter + pagination.
+
+        Excludes the bulky extraction_result blob — callers fetch the full
+        record via get(case_id) when they need it.
+        """
+        cols = (
+            "case_id, case_number, state, cert_type, funding_program, "
+            "confidence, error, created_at, updated_at, extracted_at, "
+            "mulesoft_done_at, completed_at"
+        )
+        with self._connect() as conn:
+            if state:
+                rows = conn.execute(
+                    f"SELECT {cols} FROM audit_jobs WHERE state = ? "
+                    "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (state, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT {cols} FROM audit_jobs "
+                    "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def count(self, state: str | None = None) -> int:
+        with self._connect() as conn:
+            if state:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM audit_jobs WHERE state = ?",
+                    (state,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM audit_jobs",
+                ).fetchone()
+            return row["n"]
+
     def list_known_case_ids(self) -> set[str]:
         """Return all case IDs IDP has touched (in any state).
 

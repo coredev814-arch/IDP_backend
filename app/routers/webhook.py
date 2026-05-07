@@ -340,23 +340,92 @@ def mulesoft_done(
 
 
 # ---------------------------------------------------------------------------
-# Read endpoint: inspect a case's audit job
+# Read endpoints: list jobs / inspect one case
 # ---------------------------------------------------------------------------
+
+@router.get("/audit/cases")
+def list_cases(
+    state: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """List audit jobs from the local JobStore.
+
+    Query params:
+      state  — optional filter (done, extracting, extracted, comparing,
+               pending, extraction_failed, comparison_failed,
+               mulesoft_timeout). Omit to see all states.
+      limit  — page size (default 100, max 500).
+      offset — page offset.
+
+    Returns lightweight rows (no findings_text or extraction_result).
+    Use GET /audit/cases/{case_id} to drill into one job's findings.
+    """
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    store = get_job_store(settings.audit_job_db)
+    rows = store.list_all(state=state, limit=limit, offset=offset)
+    total = store.count(state=state)
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "state_filter": state,
+        "items": rows,
+    }
+
 
 @router.get("/audit/cases/{case_id}")
 def get_case_audit(
     case_id: str,
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    """Return the current state of an audit job, including findings text."""
+    """Return the audit state for a case.
+
+    Cases in flight live in the local JobStore (transient queue).
+    Cases that finished have been written back to Salesforce and removed
+    locally — for those we fall back to reading IDP_Testing_Results__c
+    from the Case record itself, so this endpoint stays useful for both.
+    """
     store = get_job_store(settings.audit_job_db)
     job = store.get(case_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not in audit store")
+    if job is not None:
+        # Don't return the full extraction blob — too large.
+        job.pop("extraction_result", None)
+        job["source"] = "jobstore"
+        return job
 
-    # Don't return the full extraction blob in this endpoint — too large.
-    job.pop("extraction_result", None)
-    return job
+    # Local miss → check Salesforce. The case may have been audited and
+    # cleaned up, or may not exist at all.
+    try:
+        from app.services.salesforce.client import get_salesforce_client
+        sf = get_salesforce_client(settings)
+        record = sf.get_case_findings(case_id)
+    except Exception as exc:
+        logger.exception("Salesforce fallback failed for case %s", case_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Case not in local store and Salesforce lookup failed: {exc}",
+        )
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Case {case_id} not found in JobStore or Salesforce",
+        )
+
+    return {
+        "source": "salesforce",
+        "case_id": record.get("Id"),
+        "case_number": record.get("CaseNumber"),
+        "cert_type": record.get("CertType__c"),
+        "funding_program": record.get("Funding_Program2__c"),
+        "audit_complete": bool(record.get("IDP_Audit_Complete__c")),
+        "findings_text": record.get("IDP_Testing_Results__c"),
+    }
 
 
 # ---------------------------------------------------------------------------
