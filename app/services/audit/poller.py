@@ -21,13 +21,7 @@ import time
 
 from app.core.config import Settings
 from app.core.dependencies import get_settings
-from app.services.audit.job_store import (
-    COMPARING,
-    DONE,
-    EXTRACTED,
-    EXTRACTING,
-    get_job_store,
-)
+from app.services.audit.job_store import EXTRACTED, get_job_store
 from app.services.audit.jobs import run_comparison, run_extraction
 from app.services.salesforce.client import _escape_soql, get_salesforce_client
 
@@ -75,16 +69,6 @@ def fetch_ready_cases(settings: Settings, limit: int) -> list[dict]:
     sf = get_salesforce_client(settings)
     result = sf.sf.query(_build_ready_query(limit))
     return result.get("records", [])
-
-
-def is_already_processed(case_id: str, settings: Settings) -> bool:
-    """Skip cases the local JobStore already has in a non-restartable state."""
-    store = get_job_store(settings.audit_job_db)
-    job = store.get(case_id)
-    if not job:
-        return False
-    # Reprocess only if the previous run failed
-    return job["state"] in (EXTRACTING, EXTRACTED, COMPARING, DONE)
 
 
 def process_case(case_record: dict, settings: Settings) -> None:
@@ -147,12 +131,10 @@ def process_case(case_record: dict, settings: Settings) -> None:
 def poll_once(settings: Settings) -> int:
     """Run one polling cycle. Returns count of cases processed.
 
-    Dedup is handled by the local JobStore (`is_already_processed`).
-    Salesforce's IDP_Testing_Results__c is Long Text Area and can't be
-    used in WHERE clauses, so we filter at the application level.
-
-    The local JobStore is only used as defense-in-depth for multi-worker
-    race conditions.
+    Dedup is handled by Salesforce — the SOQL filter excludes cases where
+    IDP_Audit_Complete__c=TRUE. process_case() then defers to JobStore's
+    upsert_pending for in-flight dedup. Writeback failures auto-retry on
+    the next cycle (the SF flag stays FALSE until writeback succeeds).
     """
     cases = fetch_ready_cases(
         settings,
@@ -165,15 +147,10 @@ def poll_once(settings: Settings) -> int:
 
     processed = 0
     for case in cases:
-        # Defense-in-depth: re-check locally after Salesforce returns
-        # results, in case another worker claimed it between query and
-        # processing (multi-worker scenarios).
-        if is_already_processed(case["Id"], settings):
-            logger.debug(
-                "Skipping case %s — already in non-restartable state",
-                case.get("CaseNumber") or case["Id"],
-            )
-            continue
+        # No local pre-filter needed — Salesforce's IDP_Audit_Complete__c
+        # filter excludes already-audited cases, and process_case() defers
+        # to JobStore.upsert_pending for in-flight dedup. If a writeback
+        # previously failed, the SOQL re-fetches and we auto-retry.
         try:
             process_case(case, settings)
             processed += 1

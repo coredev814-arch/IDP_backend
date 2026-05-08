@@ -55,6 +55,56 @@ def _format_failure_marker(case_number: str, stage: str, error: str) -> str:
     )
 
 
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Return True if the exception looks transient — auto-retry on next cycle.
+
+    Conservative: only known-transient classes (rate limits, server errors,
+    network/timeout, billing). Permanent issues (auth, schema, bugs in our
+    code) get the failure-marker treatment so they drop out of the queue
+    instead of looping.
+
+    Detected by both Anthropic SDK exception type AND error-message text,
+    since some 400s carry billing/throttling info despite the strict type.
+    """
+    msg = str(exc).lower()
+
+    # Anthropic SDK typed exceptions — most precise signal
+    try:
+        import anthropic
+        if isinstance(exc, (
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+            anthropic.APITimeoutError,
+            anthropic.APIConnectionError,
+        )):
+            return True
+        if isinstance(exc, anthropic.BadRequestError):
+            # Credit balance / quota exhaustion comes back as 400 — retryable
+            # because adding funds restores service. Other 400s (schema,
+            # malformed prompt) are bugs we should surface, not retry.
+            return (
+                "credit balance" in msg
+                or "quota" in msg
+                or "rate limit" in msg
+            )
+    except ImportError:
+        pass
+
+    # Generic transient-error fingerprints (httpx/network/RunPod proxy)
+    transient_markers = (
+        "rate limit",
+        "credit balance",
+        "overloaded",
+        "service unavailable",
+        "gateway timeout",
+        "timeout",
+    )
+    if any(marker in msg for marker in transient_markers):
+        return True
+
+    return False
+
+
 def _finalize_case(
     case_id: str,
     case_number: str,
@@ -165,10 +215,23 @@ def run_extraction(case_id: str) -> None:
         logger.exception("Extraction failed for case %s", case_id)
         error_str = f"{type(exc).__name__}: {exc}"
         store.mark_extraction_failed(case_id, error_str)
-        # Write the failure marker to Salesforce so the case drops out of
-        # the SOQL on next poll. Then drop the local row — JobStore is a
-        # transient queue, not an archive.
         case_number = (job.get("case_number") if job else None) or case_id
+
+        if _is_retryable_error(exc):
+            # Transient (rate limit, credit balance, server error, timeout).
+            # Don't write a failure marker or flip IDP_Audit_Complete__c —
+            # leave the SF flag FALSE so the next poll cycle re-fetches and
+            # tries again. Local row stays in extraction_failed for context;
+            # upsert_pending will overwrite it on the next attempt.
+            logger.warning(
+                "Retryable extraction error for case=%s — leaving for next "
+                "poll cycle (no Salesforce writeback): %s",
+                case_number, error_str,
+            )
+            return
+
+        # Permanent failure — write marker + flip flag so case drops out
+        # of the queue. JobStore is a transient queue, not an archive.
         _finalize_case(
             case_id, case_number, settings,
             text_for_salesforce=_format_failure_marker(
@@ -322,6 +385,15 @@ def run_comparison(case_id: str) -> None:
         error_str = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         store.mark_comparison_failed(case_id, error_str)
         case_number = (job.get("case_number") if job else None) or case_id
+
+        if _is_retryable_error(exc):
+            logger.warning(
+                "Retryable comparison error for case=%s — leaving for next "
+                "poll cycle (no Salesforce writeback): %s",
+                case_number, f"{type(exc).__name__}: {exc}",
+            )
+            return
+
         _finalize_case(
             case_id, case_number, settings,
             text_for_salesforce=_format_failure_marker(
