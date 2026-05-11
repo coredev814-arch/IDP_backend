@@ -22,7 +22,7 @@ import time
 from app.core.config import Settings
 from app.core.dependencies import get_settings
 from app.services.audit.job_store import EXTRACTED, get_job_store
-from app.services.audit.jobs import run_comparison, run_extraction
+from app.services.audit.jobs import run_comparison, run_extraction, watchdog_sweep
 from app.services.salesforce.client import _escape_soql, get_salesforce_client
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,19 @@ def poll_once(settings: Settings) -> int:
     IDP_Audit_Complete__c=TRUE. process_case() then defers to JobStore's
     upsert_pending for in-flight dedup. Writeback failures auto-retry on
     the next cycle (the SF flag stays FALSE until writeback succeeds).
+
+    Before fetching new work, the watchdog re-queues (or finalizes) any
+    rows wedged in extracting/extracted/comparing past the threshold.
     """
+    # Watchdog first — recover rows wedged by previous worker deaths so
+    # they don't permanently block the same case_ids from progressing.
+    try:
+        recovered = watchdog_sweep(settings)
+        if recovered:
+            logger.info("Watchdog acted on %d wedged job(s)", recovered)
+    except Exception:
+        logger.exception("Watchdog sweep failed — continuing with poll cycle")
+
     cases = fetch_ready_cases(
         settings,
         settings.audit_poll_batch_size,

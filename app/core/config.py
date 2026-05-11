@@ -119,3 +119,11 @@ class Settings(BaseSettings):
     # or the timeout fires.
     audit_extraction_wait_seconds: int = 600    # 10 minutes
     audit_extraction_poll_seconds: int = 15
+
+    # Watchdog — recovers cases stuck in extracting/extracted/comparing
+    # after a worker died mid-flight (deploy, OOM, crash). On every poll
+    # cycle the watchdog scans for rows older than `watchdog_seconds`
+    # and re-queues them up to `watchdog_max_retries` times. Permanent
+    # failure marker after the cap so they drop out of the queue.
+    audit_watchdog_seconds: int = 1800           # 30 minutes
+    audit_watchdog_max_retries: int = 5

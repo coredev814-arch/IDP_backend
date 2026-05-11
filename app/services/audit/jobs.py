@@ -140,6 +140,83 @@ def _finalize_case(
 
 
 # ---------------------------------------------------------------------------
+# Watchdog — recover cases wedged in transient states
+# ---------------------------------------------------------------------------
+
+# States that should be transient. If a row sits in any of these past
+# the watchdog threshold, the worker that started it almost certainly
+# died (deploy mid-extraction, OOM, etc.) — we need to either retry it
+# or surface it as failed.
+_WEDGE_PRONE_STATES: tuple[str, ...] = (EXTRACTING, EXTRACTED, COMPARING)
+
+
+def watchdog_sweep(settings: Settings) -> int:
+    """Re-queue (or finalize as failed) jobs that have been wedged for too long.
+
+    Why this is needed: when a service restart kills a worker mid-extraction,
+    the JobStore row stays in `extracting`/`comparing` forever. The next
+    poll cycle fetches the case (Salesforce flag still FALSE), upsert_pending
+    sees the in-flight state and skips. The case is stuck.
+
+    On every poll cycle, before fetching from Salesforce, this scans for
+    rows older than `audit_watchdog_seconds` in wedge-prone states and:
+      - retry_count < cap  -> reset row to PENDING (next poll re-runs)
+      - retry_count >= cap -> write failure marker to SF + delete row
+
+    Returns count of rows acted on.
+    """
+    store = _store(settings)
+    stale = settings.audit_watchdog_seconds
+    cap = settings.audit_watchdog_max_retries
+
+    wedged = store.list_wedged(_WEDGE_PRONE_STATES, stale_seconds=stale)
+    if not wedged:
+        return 0
+
+    logger.warning(
+        "Watchdog: %d wedged job(s) detected (>%ds in %s)",
+        len(wedged), stale, list(_WEDGE_PRONE_STATES),
+    )
+
+    for job in wedged:
+        case_id = job["case_id"]
+        case_number = job.get("case_number") or case_id
+        retries = int(job.get("retry_count") or 0)
+        state = job["state"]
+        age_seconds = int(time.time() - (job.get("updated_at") or 0))
+
+        if retries < cap:
+            # Re-queue. retry_count auto-increments inside reset_to_pending.
+            store.reset_to_pending(case_id)
+            logger.warning(
+                "Watchdog: re-queued case=%s (was %s for %ds, attempt %d/%d)",
+                case_number, state, age_seconds, retries + 1, cap,
+            )
+        else:
+            # Permanently failed — likely a broken case (giant PDF, OCR
+            # service down, etc.). Write failure marker so it drops out
+            # of the Salesforce queue and stops looping.
+            err = (
+                f"Wedged in '{state}' state for {age_seconds // 60}m after "
+                f"{retries} retries. Worker died mid-flight repeatedly — "
+                f"likely caused by service restarts during a slow extraction "
+                f"or a permanently failing dependency."
+            )
+            logger.error(
+                "Watchdog: case=%s exceeded retry cap (%d/%d) — finalizing as failed",
+                case_number, retries, cap,
+            )
+            _finalize_case(
+                case_id, case_number, settings,
+                text_for_salesforce=_format_failure_marker(
+                    case_number, state, err,
+                ),
+            )
+
+    return len(wedged)
+
+
+# ---------------------------------------------------------------------------
 # Extraction job (triggered by webhook 1: PDF attached)
 # ---------------------------------------------------------------------------
 

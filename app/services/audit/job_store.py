@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS audit_jobs (
     updated_at REAL NOT NULL,
     extracted_at REAL,
     mulesoft_done_at REAL,
-    completed_at REAL
+    completed_at REAL,
+    retry_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_state ON audit_jobs(state);
@@ -67,6 +68,18 @@ class JobStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Backfill retry_count on databases created before the column
+            # existed. PRAGMA-then-ALTER is safer than catching exceptions.
+            existing_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(audit_jobs)").fetchall()
+            }
+            if "retry_count" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE audit_jobs "
+                    "ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+                )
+                logger.info("Added retry_count column to existing audit_jobs table")
         logger.info("Audit job store ready at %s", db_path)
 
     @contextmanager
@@ -352,6 +365,60 @@ class JobStore:
         with self._lock, self._connect() as conn:
             cur = conn.execute("DELETE FROM audit_jobs")
             return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Watchdog support — detect & recover wedged rows
+    # ------------------------------------------------------------------
+
+    def list_wedged(
+        self,
+        states: tuple[str, ...],
+        stale_seconds: float,
+    ) -> list[dict[str, Any]]:
+        """Find rows in the given states whose updated_at is older than now-stale_seconds.
+
+        Used by the watchdog to detect cases that started processing but
+        never reached a terminal state — typically because the worker
+        died mid-flight (deploy, OOM, crash).
+        """
+        if not states:
+            return []
+        cutoff = time.time() - stale_seconds
+        placeholders = ",".join("?" * len(states))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT case_id, case_number, state, retry_count, updated_at "
+                f"FROM audit_jobs "
+                f"WHERE state IN ({placeholders}) AND updated_at < ?",
+                (*states, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def reset_to_pending(self, case_id: str) -> bool:
+        """Reset a row back to PENDING state and increment retry_count.
+
+        Preserves identity fields (case_number, cert_type, funding_program,
+        content_document_id) but wipes anything from the prior attempt
+        (extraction_result, findings, timestamps, error). Returns True
+        if a row was reset, False if no row existed.
+        """
+        with self._lock, self._connect() as conn:
+            now = time.time()
+            cur = conn.execute("""
+                UPDATE audit_jobs
+                SET state = ?,
+                    retry_count = retry_count + 1,
+                    updated_at = ?,
+                    error = NULL,
+                    extraction_result = NULL,
+                    findings_text = NULL,
+                    confidence = NULL,
+                    extracted_at = NULL,
+                    mulesoft_done_at = NULL,
+                    completed_at = NULL
+                WHERE case_id = ?
+            """, (PENDING, now, case_id))
+            return cur.rowcount > 0
 
 
 _SINGLETON: JobStore | None = None
