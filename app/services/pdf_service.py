@@ -152,23 +152,28 @@ def process_pdf(pdf_bytes: bytes, settings: Settings) -> dict:
             "Return ONLY the extracted text, no commentary."
         )
 
-        for page_num in low_quality_pages:
-            # Find the processed image path for this page
-            img_path = None
-            for pn, path in processed_paths:
-                if pn == page_num:
-                    img_path = str(path)
-                    break
-            if not img_path:
-                continue
+        path_by_page = {pn: str(p) for pn, p in processed_paths}
 
+        def _vision_one(page_num: int) -> tuple[int, str | None]:
+            img_path = path_by_page.get(page_num)
+            if not img_path:
+                return page_num, None
             try:
-                vision_text = call_llm_vision(
+                return page_num, call_llm_vision(
                     _VISION_PROMPT,
                     f"Extract all text from page {page_num} of this document.",
                     [img_path],
                     settings,
                 )
+            except Exception:
+                logger.exception(
+                    "Vision fallback page=%d failed — keeping original OCR text",
+                    page_num,
+                )
+                return page_num, None
+
+        with ThreadPoolExecutor(max_workers=settings.ocr_concurrency) as pool:
+            for page_num, vision_text in pool.map(_vision_one, low_quality_pages):
                 if vision_text and len(vision_text.strip()) > len(ocr_results[page_num].get("text", "").strip()):
                     logger.info(
                         "Vision fallback page=%d: replaced %d chars with %d chars",
@@ -182,16 +187,11 @@ def process_pdf(pdf_bytes: bytes, settings: Settings) -> dict:
                     flags = ocr_results[page_num].setdefault("flag_details", [])
                     if isinstance(flags, list) and "vision_fallback" not in flags:
                         flags.append("vision_fallback")
-                else:
+                elif vision_text is not None:
                     logger.info(
                         "Vision fallback page=%d: vision produced less text than OCR, keeping original",
                         page_num,
                     )
-            except Exception:
-                logger.exception(
-                    "Vision fallback page=%d failed — keeping original OCR text",
-                    page_num,
-                )
 
     # Phase C: write text files + build pages list in order.
     pages = []

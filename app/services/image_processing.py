@@ -10,20 +10,15 @@ def preprocess_for_ocr(
 ) -> Image.Image:
     """Pre-process an image to maximize OCR accuracy.
 
-    All enhancement runs at the full render resolution to preserve detail
-    for deskew angle estimation, non-local-means denoising, and edge-
-    preserving sharpen. The resize happens last so that downsampling
-    operates on an already-enhanced image.
-
     Pipeline:
     1. Grayscale
-    2. Background normalization (remove shadows/vignetting)
-    3. CLAHE contrast enhancement
-    4. Non-local means denoise (preserves text strokes)
-    5. Sharpen to reinforce text edges
-    6. Deskew
-    7. Resize to target dimensions (aspect-ratio preserved)
-    8. White border padding
+    2. Resize to target dimensions (aspect-ratio preserved)
+    3. Background normalization (remove shadows/vignetting)
+    4. CLAHE contrast enhancement
+    5. Bilateral denoise (edge-preserving, fast)
+    6. Sharpen to reinforce text edges
+    7. Deskew
+    8. White border padding to exact canvas size
     """
     img = np.array(pil_image)
 
@@ -33,41 +28,38 @@ def preprocess_for_ocr(
     else:
         gray = img
 
-    # 2. Background normalization at full resolution.
-    #    Removes shadows, vignetting, uneven lighting.
-    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=51)
-    normalized = cv2.divide(gray, background, scale=255)
-
-    # 3. CLAHE — locally adaptive contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(normalized)
-
-    # 4. Gentle denoise — preserves text strokes and handwriting.
-    #    Critical for photocopies, faxes, and older scans.
-    denoised = cv2.fastNlMeansDenoising(
-        enhanced, h=5, templateWindowSize=7, searchWindowSize=21,
-    )
-
-    # 5. Sharpen to reinforce text edges before downscale
-    blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=1.0)
-    sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
-
-    # 6. Deskew at full resolution for accurate angle estimation
-    result = _deskew(sharpened)
-
-    # 7. Resize to fit within the target canvas (aspect-ratio preserved),
-    #    then pad with white to reach EXACTLY max_width × max_height.
-    #    Consistent output resolution matches DeepSeek-OCR's vision encoder
-    #    input size exactly so the model never internally resizes.
-    h, w = result.shape
+    # 2. Resize first so every downstream filter runs on the small image.
+    #    OCR target is 1280×1920; running CLAHE/denoise/deskew at full
+    #    render resolution wastes ~5–10× the compute for no quality gain.
+    h, w = gray.shape
     scale = min(max_width / w, max_height / h)
     if scale != 1.0:
         interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
         new_w = int(round(w * scale))
         new_h = int(round(h * scale))
-        result = cv2.resize(result, (new_w, new_h), interpolation=interp)
+        resized = cv2.resize(gray, (new_w, new_h), interpolation=interp)
     else:
+        resized = gray
         new_w, new_h = w, h
+
+    # 3. Background normalization. Kernel sized for the resized image.
+    background = cv2.GaussianBlur(resized, (0, 0), sigmaX=31)
+    normalized = cv2.divide(resized, background, scale=255)
+
+    # 4. CLAHE — locally adaptive contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(normalized)
+
+    # 5. Bilateral filter — edge-preserving denoise. An order of magnitude
+    #    faster than fastNlMeansDenoising and keeps text strokes crisp.
+    denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=35, sigmaSpace=5)
+
+    # 6. Sharpen to reinforce text edges
+    blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=1.0)
+    sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+
+    # 7. Deskew on the resized image — minAreaRect is much cheaper here.
+    result = _deskew(sharpened)
 
     # 8. Pad to exact canvas size with white borders (centered).
     pad_w = max_width - new_w

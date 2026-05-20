@@ -20,6 +20,3 @@ def setup_logging(settings: Settings) -> None:
     root.setLevel(level)
     root.handlers.clear()
     root.addHandler(handler)
-
-    # Quieten noisy third-party loggers
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
