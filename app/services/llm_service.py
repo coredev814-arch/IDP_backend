@@ -6,10 +6,15 @@ import re
 import time
 
 import anthropic
+import httpx
 
 from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
+
+# Bound every Anthropic call so a half-closed/stalled connection can't hang the
+# worker forever. Read is the long one — extraction responses can take a while.
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
 _MAX_RETRIES = 4
 _RATE_LIMIT_BASE_DELAY = 30  # seconds — rate limit window is per minute
@@ -25,7 +30,7 @@ _TRANSIENT_EXCS = (
 
 
 def _get_client(settings: Settings) -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    return anthropic.Anthropic(api_key=settings.anthropic_api_key, timeout=_HTTP_TIMEOUT)
 
 
 def call_llm(
