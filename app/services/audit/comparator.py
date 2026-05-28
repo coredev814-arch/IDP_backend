@@ -4,6 +4,7 @@ Produces a list of structured Findings + a confidence score for the case.
 Pure logic — no Salesforce calls, no I/O. Takes two dicts in, returns a result.
 """
 import logging
+import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
@@ -164,8 +165,11 @@ def _normalize_org_name(name: str | None) -> str:
     raw = _norm(name)
     if not raw:
         return ""
-    # Strip punctuation that commonly appears in business names
-    cleaned = raw.replace(",", " ").replace(".", " ").replace("'", "")
+    # Strip punctuation that commonly appears in business names.
+    # Slash/ampersand/hyphen are token separators ("Aarp/New York Life" should
+    # tokenize as ["aarp", "new", "york", "life"], not keep "aarp/new" joined),
+    # so they become spaces. Apostrophes are removed (don't → dont, one token).
+    cleaned = re.sub(r"[,./&\-]", " ", raw).replace("'", "")
     tokens = [t for t in cleaned.split() if t]
     # Drop trailing org suffixes
     while tokens and tokens[-1] in _ORG_SUFFIXES:
@@ -768,15 +772,17 @@ def _compare_assets(
         for sf_k in sf_only_list:
             if sf_k in fuzzy_matched_sf_assets:
                 continue
-            # accountType must be compatible after normalization
-            # ('Checking' ≈ 'Checking Account', 'Investment' ≈ 'Brokerage').
-            if not _account_types_compatible(ai_type, sf_k[1]):
-                continue
             sf_rec = sf_keys[sf_k][0]
             sf_src_norm = _normalize_org_name(sf_k[0])
             sf_bal = _money(
                 sf_rec.get("Cash_Value__c") or sf_rec.get("VOA_Current__c")
             )
+            # accountType compatibility ('Checking' ≈ 'Checking Account',
+            # 'Investment' ≈ 'Brokerage'). NOT a hard filter — AI and MuleSoft
+            # often disagree on type (e.g. AI labels "Direct Express" as the
+            # type while MuleSoft labels it "Other"). Gates looser matches
+            # below; bypassed for near-perfect (≥0.95) name matches.
+            type_ok = _account_types_compatible(ai_type, sf_k[1])
 
             # Score = combination of name similarity and balance match.
             # Use _name_similarity (full-string + per-token) to catch
@@ -790,15 +796,21 @@ def _compare_assets(
                 and _close(ai_bal, sf_bal, tolerance=0.02)
             )
 
-            # Near-perfect name match: same asset regardless of balance.
-            # MuleSoft sometimes leaves Cash_Value__c as 0 or null even
-            # when AI extracted a real balance from the PDF — surface as
-            # a value mismatch rather than two missing/missed entries.
+            # Near-perfect name match: same asset regardless of balance OR
+            # account type. MuleSoft sometimes leaves Cash_Value__c as 0/null
+            # even when AI extracted a real balance — and type strings often
+            # disagree between systems. Surface as a value mismatch rather
+            # than two missing/missed entries.
             if name_score >= 0.95:
                 if name_score > best_score:
                     best_score = name_score
                     best_sf_k = sf_k
                     continue
+            # Below 0.95, looser matches require accountType compatibility to
+            # avoid false positives (otherwise unrelated assets with similar
+            # balances would fuzzy-match across types).
+            if not type_ok:
+                continue
             # Strong match: balance matches AND (name similar OR one source is empty)
             if balance_match and (name_score >= 0.85 or not ai_src_norm or not sf_src_norm):
                 if name_score > best_score:
