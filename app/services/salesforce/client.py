@@ -3,11 +3,13 @@
 Reads case context, audit data, and PDF attachments. Writes audit findings
 back to the Case via update_case_findings (Long Text Area field).
 """
+import io
 import logging
 import threading
 import time
 from typing import Any
 
+import fitz  # PyMuPDF — used to count pages before pushing into the pipeline
 from simple_salesforce import Salesforce
 
 from app.core.config import Settings
@@ -234,6 +236,7 @@ class SalesforceClient:
                 headers={"Authorization": f"Bearer {self.sf.session_id}"},
             )
             if response.status_code == 200 and len(response.content) > 1000:
+                self._check_min_pages(response.content, version.get("Title"))
                 return response.content
             logger.warning(
                 "PDF download attempt %d failed: status=%d size=%d",
@@ -243,6 +246,21 @@ class SalesforceClient:
         raise RuntimeError(
             f"Failed to download PDF {content_document_id} after 3 attempts"
         )
+
+    def _check_min_pages(self, pdf_bytes: bytes, title: str | None) -> None:
+        """Reject PDFs below settings.min_pdf_pages.
+
+        Counting locally with PyMuPDF is ~milliseconds and avoids burning OCR
+        + LLM tokens on documents that can't possibly be a complete packet.
+        """
+        threshold = self._settings.min_pdf_pages
+        with fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf") as doc:
+            page_count = doc.page_count
+        if page_count < threshold:
+            raise ValueError(
+                f"PDF too short to be a source packet: {page_count} page(s) "
+                f"< minimum {threshold} (title: {title or '?'})"
+            )
 
     # ------------------------------------------------------------------
     # Write methods
@@ -360,10 +378,15 @@ class SalesforceClient:
                         cd.get("Title"), case_id, skipped_titles,
                     )
                 return pdf_bytes, cd_id
-            except ValueError:
-                # Defensive — the SOQL filter should have already excluded
-                # non-PDFs, but ContentVersion.FileExtension can drift from
-                # ContentDocument.FileExtension in rare edge cases.
+            except ValueError as exc:
+                # download_pdf raises ValueError when the candidate is not a
+                # source packet: wrong file extension, denylisted title, or
+                # below the min-pages threshold. Move on to the next PDF.
+                logger.info(
+                    "Skipped candidate PDF '%s' for case %s: %s",
+                    cd.get("Title") or cd_id, case_id, exc,
+                )
+                skipped_titles.append(cd.get("Title") or cd_id)
                 continue
 
         raise ValueError(

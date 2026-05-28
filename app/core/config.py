@@ -75,6 +75,12 @@ class Settings(BaseSettings):
         "application/pdf",
         "application/octet-stream",
     ]
+    # PDFs below this page count are rejected as non-source documents.
+    # Real recertification packets always contain at minimum a HUD 50059
+    # or TIC plus supporting verifications — they don't exist in 1-3 pages.
+    # Anything smaller is almost always a coversheet, stray attachment,
+    # partial upload, or a non-source doc the title denylist missed.
+    min_pdf_pages: int = 4
 
     # ------------------------------------------------------------------
     # Salesforce integration
