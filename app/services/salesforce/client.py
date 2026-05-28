@@ -213,6 +213,19 @@ class SalesforceClient:
                 f"(extension: {version.get('FileExtension')})"
             )
 
+        # Defense in depth: even when the webhook specified this document
+        # explicitly, refuse to process audit/review titles. get_pdf_for_case
+        # filters these on the fallback path; without this check a webhook
+        # that passes a Certification Review's content_document_id would
+        # bypass that filter entirely.
+        title = (version.get("Title") or "").lower()
+        for token in self._PDF_TITLE_DENYLIST:
+            if token in title:
+                raise ValueError(
+                    f"Refusing to process denylisted document title "
+                    f"{version.get('Title')!r} (matches '{token}')"
+                )
+
         version_data = version["VersionData"]
         download_url = f"https://{self.sf.sf_instance}{version_data}"
         for attempt in range(3):
