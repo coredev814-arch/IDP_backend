@@ -465,6 +465,34 @@ def _build_texts(groups: list[DocumentGroup]) -> list[str]:
     return texts
 
 
+def _retry_if_incomplete(label: str, *, gate, fill) -> None:
+    """Run one self-healing retry pass on a just-extracted result.
+
+    Every extractor has the same shape: do a first LLM pass, decide whether the
+    result is incomplete, and if so re-ask for just the missing parts. LLM
+    extraction is non-deterministic, so a single targeted retry recovers
+    fields/records the first pass dropped. This driver is that shape, factored
+    out so each extractor only declares what "incomplete" means and how to fix
+    it; adding a retry to a new schema is then just two closures.
+
+      gate() -> spec | falsy : a truthy "what's missing" spec when a retry is
+          warranted (null fields, missed groups, amountless records, ...),
+          else falsy to skip.
+      fill(spec) -> None     : mutate the result in place to fill the gap.
+
+    fill may raise — a retry failure is logged and swallowed so the first-pass
+    result is never lost. Max 1 retry (no loop).
+    """
+    spec = gate()
+    if not spec:
+        return
+    logger.info("%s: incomplete after first pass — running targeted retry", label)
+    try:
+        fill(spec)
+    except Exception:
+        logger.exception("%s: retry failed — keeping first-pass result", label)
+
+
 # ---------------------------------------------------------------------------
 # Extraction functions
 # ---------------------------------------------------------------------------
@@ -530,13 +558,11 @@ def extract_certification_info(
 
     cert_info_dict = result.get("certificationInfo", {}) or {}
 
-    # --- Targeted retry for missing critical fields ---
-    missing = [f for f in _CRITICAL_CERT_FIELDS if not cert_info_dict.get(f)]
-    if missing:
-        logger.info(
-            "Cert info partial extraction — retrying for %d missing fields: %s",
-            len(missing), missing,
-        )
+    # --- Self-healing retry: recover critical fields that came back null ---
+    def _gate():
+        return [f for f in _CRITICAL_CERT_FIELDS if not cert_info_dict.get(f)]
+
+    def _fill(missing: list[str]) -> None:
         retry_dict = _retry_cert_info_fields(
             relevant_texts, missing, cert_info_dict, certification_type, settings,
         )
@@ -547,8 +573,10 @@ def extract_certification_info(
                 cert_info_dict[field] = retry_val
         recovered = [f for f in missing if cert_info_dict.get(f)]
         if recovered:
-            logger.info("Retry recovered %d/%d fields: %s",
+            logger.info("Cert info retry recovered %d/%d fields: %s",
                         len(recovered), len(missing), recovered)
+
+    _retry_if_incomplete("Cert info", gate=_gate, fill=_fill)
 
     # Cert type is caller-provided (frontend upload form / API param).
     # Overwrite any LLM guess with the authoritative value.
@@ -641,8 +669,6 @@ def _retry_cert_info_fields(
     Sends a narrower prompt asking for ONLY the missing fields, along with
     the already-extracted values as context so the model can cross-reference.
     """
-    from app.services.llm_service import call_llm_json as _call
-
     # Show already-extracted values so the retry has context but knows not
     # to overwrite them.
     context_lines = [
@@ -663,7 +689,7 @@ def _retry_cert_info_fields(
     user_prompt += _get_cert_context(certification_type)
 
     try:
-        result = _call(_CERT_INFO_RETRY_PROMPT, user_prompt, settings)
+        result = call_llm_json(_CERT_INFO_RETRY_PROMPT, user_prompt, settings)
     except Exception:
         logger.exception("Cert info retry call failed — keeping original values")
         return {}
@@ -679,7 +705,21 @@ def extract_income(
     settings: Settings,
     certification_type: str | None = None,
 ) -> IncomeExtraction:
-    """Extract income data from pre-routed income document groups."""
+    """Extract income data from pre-routed income document groups.
+
+    After the first pass, any income record that was extracted WITH a source
+    but WITHOUT a dollar amount triggers one targeted retry for just those
+    records. LLM extraction is non-deterministic — the same prompt can name a
+    source on one run and drop its amount on the next. A focused retry ("find
+    the amount for these specific sources") usually recovers it. An income
+    record with a name but no amount is unusable downstream (no income
+    calculation, no MuleSoft comparison value), so it's worth one more look.
+
+    A second retry recovers income SOURCES dropped entirely: if a classified
+    benefit document (SSA/SSI/SSDI/pension/child support) yielded no record of
+    its type, that document is re-extracted on its own. Both retries go through
+    the shared _retry_if_incomplete driver; each is max 1 and fail-safe.
+    """
     relevant_texts = _build_texts(groups)
     if not relevant_texts:
         logger.info("No income documents found")
@@ -691,13 +731,290 @@ def extract_income(
     result = call_llm_json(INCOME_SYSTEM_PROMPT, user_prompt, settings)
     result = validation.validate_income(result)
 
-    si = result.get("sourceIncome", {})
+    # Re-bind to the actual lists inside `result` so a retry that APPENDS
+    # (source recovery) propagates — `or []` on an empty list would otherwise
+    # hand back a fresh, disconnected list.
+    si = result.get("sourceIncome") or {}
+    result["sourceIncome"] = si
+    vi_entries = si.get("verificationIncome") or []
+    si["verificationIncome"] = vi_entries
+    ps_entries = si.get("payStub") or []
+    si["payStub"] = ps_entries
+
+    # --- Self-healing retry #1: recover income SOURCES dropped entirely.
+    # A classified benefit document (SSA/SSI/SSDI/pension/child support) whose
+    # income type produced no record means the source was dropped on the first
+    # pass — re-extract that document on its own. Runs BEFORE the amount retry
+    # so a recovered source can still get its amount filled below.
+    def _cov_gate():
+        return _income_coverage_gaps(groups, vi_entries) or None
+
+    def _cov_fill(gaps) -> None:
+        added = _retry_income_coverage(gaps, vi_entries, certification_type, settings)
+        if added:
+            logger.info("Income coverage retry recovered %d dropped source(s)", added)
+
+    _retry_if_incomplete("Income coverage", gate=_cov_gate, fill=_cov_fill)
+
+    # --- Self-healing retry #2: recover amounts for records that have a source
+    # but no dollar figure. Records with no name AND no amount are noise
+    # (validate_income already drops them), so they don't trigger a retry.
+    def _amt_gate():
+        amountless_vi = [
+            vi for vi in vi_entries
+            if (vi.get("sourceName") or vi.get("memberName")) and not _vi_has_amount(vi)
+        ]
+        amountless_ps = [
+            ps for ps in ps_entries
+            if (ps.get("sourceName") or ps.get("memberName")) and not ps.get("grossPay")
+        ]
+        return (amountless_vi, amountless_ps) if (amountless_vi or amountless_ps) else None
+
+    def _amt_fill(spec) -> None:
+        amountless_vi, amountless_ps = spec
+        recovered = _retry_income_amounts(
+            relevant_texts, amountless_vi, amountless_ps, certification_type, settings,
+        )
+        if recovered:
+            logger.info("Income retry recovered amounts for %d record(s)", recovered)
+
+    _retry_if_incomplete("Income amounts", gate=_amt_gate, fill=_amt_fill)
+
     logger.info(
         "Extracted %d pay stubs, %d verification income records",
-        len(si.get("payStub", [])),
-        len(si.get("verificationIncome", [])),
+        len(ps_entries), len(vi_entries),
     )
     return IncomeExtraction.model_validate(result)
+
+
+# Amount fields that make a verificationIncome record "usable". At least one
+# must be populated, or we know the source exists but not how much it pays.
+_VI_AMOUNT_FIELDS = ("rateOfPay", "selfDeclaredAmount", "ytdAmount", "overtimeRate")
+
+# Income types whose amount is a fixed benefit, never a YTD figure (mirrors the
+# rule in validation.validate_income). YTD recovered for these is discarded.
+_FIXED_INCOME_TYPES = (
+    "social security", "supplemental security income",
+    "social security disability", "pension",
+)
+
+
+def _vi_has_amount(vi: dict) -> bool:
+    """True if a verificationIncome record carries any usable dollar amount."""
+    return any(vi.get(f) for f in _VI_AMOUNT_FIELDS)
+
+
+_INCOME_AMOUNT_RETRY_PROMPT = """\
+You are re-examining HUD/Affordable Housing income documents to recover the
+DOLLAR AMOUNT for income sources that were extracted WITHOUT one on the first pass.
+
+Each target below is an income source already identified in the documents but
+missing its amount. For each id, find the income figure in the document text.
+Look hard — the amount is almost always present near the source name.
+
+For each target return an object with:
+  - id: the id exactly as given (e.g. "V0", "P1")
+  - rateOfPay: periodic pay/benefit rate (hourly or monthly amount), numeric string, or null
+  - frequencyOfPay: lowercase (weekly / bi-weekly / semi-monthly / monthly / hourly), or null
+  - selfDeclaredAmount: amount from a self-cert / application / questionnaire, or null
+  - ytdAmount: year-to-date amount ONLY if the document literally says "year to date", or null
+  - grossPay: gross pay for a paystub target (P ids only), numeric string, or null
+
+AMOUNT SOURCE BY INCOME TYPE:
+- Social Security / SSI / SSDI: monthly benefit in the "How Much You Will Get"
+  table → rateOfPay (monthly) + frequencyOfPay="monthly". Do NOT set ytdAmount.
+- Pension: monthly or annual pension payment → rateOfPay + frequencyOfPay.
+- Child Support / Alimony / Cash Contributions: ordered or received amount →
+  selfDeclaredAmount (or rateOfPay + frequencyOfPay if a per-period figure is shown).
+- Wages (paystub / VOI / Equifax): grossPay (paystub) or rateOfPay + frequencyOfPay (VOI).
+
+ANTI-HALLUCINATION GUARD (CRITICAL):
+- Every amount must be literal text in the document. If you cannot find an amount
+  for a target, return null for all its amount fields — do NOT invent a figure.
+- US dollar amounts: comma = thousands separator, period = decimal.
+  "$1,250" → 1250.00 (NOT 1.25). Always strip commas before parsing.
+- An amount under $20 for a monthly benefit or wage is almost always a dropped
+  digit — re-read the source.
+
+Return ONLY valid JSON: {"amounts": [{"id": "V0", ...}, ...]}"""
+
+
+def _retry_income_amounts(
+    relevant_texts: list[str],
+    amountless_vi: list[dict],
+    amountless_ps: list[dict],
+    certification_type: str | None,
+    settings: Settings,
+) -> int:
+    """Re-ask the LLM for dollar amounts on income records missing one.
+
+    Mutates the passed-in record dicts in place, filling only amount fields
+    that are currently null. Returns the count of records that gained an amount.
+    """
+    # id → (kind, record). The dicts here are the same objects held inside the
+    # result's verificationIncome/payStub lists, so filling them updates result.
+    by_id: dict[str, tuple[str, dict]] = {}
+    target_lines: list[str] = []
+    for i, vi in enumerate(amountless_vi):
+        rid = f"V{i}"
+        by_id[rid] = ("vi", vi)
+        target_lines.append(
+            f"  - id={rid} | source: {vi.get('sourceName') or '?'} | "
+            f"member: {vi.get('memberName') or '?'} | type: {vi.get('incomeType') or '?'}"
+        )
+    for i, ps in enumerate(amountless_ps):
+        rid = f"P{i}"
+        by_id[rid] = ("ps", ps)
+        target_lines.append(
+            f"  - id={rid} | employer: {ps.get('sourceName') or '?'} | "
+            f"employee: {ps.get('memberName') or '?'}"
+        )
+
+    user_prompt = (
+        "Find the dollar amount for each of these income sources:\n"
+        + "\n".join(target_lines)
+        + "\n\nDOCUMENT TEXT:\n\n"
+        + "\n\n---\n\n".join(relevant_texts)
+    )
+    user_prompt += _get_cert_context(certification_type)
+
+    try:
+        result = call_llm_json(_INCOME_AMOUNT_RETRY_PROMPT, user_prompt, settings)
+    except Exception:
+        logger.exception("Income amount retry call failed — keeping original records")
+        return 0
+
+    amounts = result.get("amounts") if isinstance(result, dict) else None
+    if not isinstance(amounts, list):
+        return 0
+
+    recovered = 0
+    for item in amounts:
+        if not isinstance(item, dict):
+            continue
+        target = by_id.get(item.get("id"))
+        if not target:
+            continue
+        kind, rec = target
+        gained = False
+        if kind == "vi":
+            income_type = (rec.get("incomeType") or "").lower()
+            for field in ("rateOfPay", "selfDeclaredAmount", "ytdAmount", "frequencyOfPay"):
+                val = item.get(field)
+                if val in (None, "", "null") or rec.get(field):
+                    continue
+                # Fixed benefits never carry a YTD figure (validation rule).
+                if field == "ytdAmount" and income_type in _FIXED_INCOME_TYPES:
+                    continue
+                if field == "frequencyOfPay":
+                    rec[field] = str(val).lower()
+                else:
+                    rec[field] = validation.normalize_money(str(val))
+                if field in _VI_AMOUNT_FIELDS and rec.get(field):
+                    gained = True
+        else:  # paystub
+            val = item.get("grossPay")
+            if val not in (None, "", "null") and not rec.get("grossPay"):
+                rec["grossPay"] = validation.normalize_money(str(val))
+                gained = bool(rec.get("grossPay"))
+        if gained:
+            recovered += 1
+
+    return recovered
+
+
+# Classified income documents that should each yield an income record of a
+# specific type. If the document is present but no record of that type was
+# extracted, the source was dropped — re-extract that document specifically.
+# Grounded in a real classified document, so recovery re-reads what's actually
+# there rather than inventing income to close a dollar gap.
+#   doc_type -> (label, acceptable normalized incomeType values, sourceName keywords)
+_INCOME_DOC_TYPE_EXPECTATIONS: dict[str, tuple[str, set[str], set[str]]] = {
+    "SSA Benefit Letter": ("Social Security", {"social security"}, {"social security administration"}),
+    "SSI Benefit Letter": ("Supplemental Security Income", {"supplemental security income"}, {"supplemental security"}),
+    "SSDI Benefit Letter": ("Social Security Disability", {"social security disability"}, {"social security disability"}),
+    "Pension Statement": ("Pension", {"pension"}, {"pension"}),
+    "Child Support Statement": ("Child Support", {"child support"}, {"child support"}),
+    "Child Support / Alimony Affidavit": ("Child Support", {"child support"}, {"child support"}),
+    "TANF Verification": ("Temporary Assistance", {"temporary assistance"}, {"tanf"}),
+    "TANF / Public Assistance Verification": ("Temporary Assistance", {"temporary assistance"}, {"tanf", "public assistance"}),
+}
+
+
+def _income_type_present(types: set[str], keywords: set[str], vi_entries: list[dict]) -> bool:
+    """True if any extracted record represents this income type — by exact
+    normalized incomeType, or a distinctive sourceName keyword."""
+    for vi in vi_entries:
+        it = (vi.get("incomeType") or "").strip().lower()
+        sn = (vi.get("sourceName") or "").strip().lower()
+        if it in types:
+            return True
+        if any(kw in sn for kw in keywords):
+            return True
+    return False
+
+
+def _income_coverage_gaps(
+    groups: list[DocumentGroup], vi_entries: list[dict],
+) -> list[tuple[DocumentGroup, str, set[str], set[str]]]:
+    """Classified income documents whose expected income type has no record."""
+    gaps: list[tuple[DocumentGroup, str, set[str], set[str]]] = []
+    for g in groups:
+        spec = _INCOME_DOC_TYPE_EXPECTATIONS.get(g.document_type)
+        if not spec:
+            continue
+        label, types, kws = spec
+        if not _income_type_present(types, kws, vi_entries):
+            gaps.append((g, label, types, kws))
+    return gaps
+
+
+def _retry_income_coverage(
+    gaps: list[tuple[DocumentGroup, str, set[str], set[str]]],
+    vi_entries: list[dict],
+    certification_type: str | None,
+    settings: Settings,
+) -> int:
+    """Re-extract income from documents whose income type was dropped entirely.
+
+    Appends only records of the expected type that aren't already present, and
+    only ones the model finds in the document (the prompt forbids inventing).
+    Mutates vi_entries in place; returns the count added.
+    """
+    added = 0
+    for g, label, types, kws in gaps:
+        # An earlier gap's retry may already have supplied this type.
+        if _income_type_present(types, kws, vi_entries):
+            continue
+        doc_text = (
+            f"[Document: {g.document_type}, Pages: {g.page_range}, "
+            f"Person: {g.person_name or 'Unknown'}]\n{g.combined_text}"
+        )
+        prompt = (
+            f"This document is a '{g.document_type}' and documents {label} income "
+            f"for the household, but the first extraction pass produced no {label} "
+            f"income record. Re-read it and extract the income record(s) it contains.\n"
+            f"Extract ONLY income actually present in this document — do NOT invent "
+            f"an amount or a source.\n\n" + doc_text
+        )
+        prompt += _get_cert_context(certification_type)
+        try:
+            result = call_llm_json(INCOME_SYSTEM_PROMPT, prompt, settings)
+            result = validation.validate_income(result)
+        except Exception:
+            logger.exception("Income coverage retry failed for %s", g.document_type)
+            continue
+        new_vis = ((result.get("sourceIncome") or {}).get("verificationIncome")) or []
+        for vi in new_vis:
+            it = (vi.get("incomeType") or "").strip().lower()
+            sn = (vi.get("sourceName") or "").strip().lower()
+            if not (it in types or any(kw in sn for kw in kws)):
+                continue   # not the type we're recovering
+            if _income_type_present(types, kws, vi_entries):
+                break      # already recovered
+            vi_entries.append(vi)
+            added += 1
+    return added
 
 
 _ASSET_DOC_TYPES_PER_RECORD = {
@@ -742,33 +1059,36 @@ def extract_assets(
     asset_records = result.get("assetInformation", []) or []
     logger.info("Extracted %d asset records (initial pass)", len(asset_records))
 
-    # Gap detection: count asset-yielding doc groups vs extracted records.
-    # Each Bank Statement / VOA / Real Estate / etc. group should produce
-    # at least one record. If we're way short, retry the missed groups.
-    expected_groups = [
-        g for g in groups
-        if g.document_type in _ASSET_DOC_TYPES_PER_RECORD
-    ]
-    if expected_groups and len(asset_records) < len(expected_groups):
+    # --- Self-healing retry: gap detection. Each Bank Statement / VOA / Real
+    # Estate / etc. group should yield at least one record; if we're short,
+    # re-extract just the missed groups.
+    def _gate():
+        expected = [g for g in groups if g.document_type in _ASSET_DOC_TYPES_PER_RECORD]
+        current = result.get("assetInformation", []) or []
+        return expected if (expected and len(current) < len(expected)) else None
+
+    def _fill(expected_groups) -> None:
+        records = result.get("assetInformation", []) or []
         retry_records = _retry_missed_asset_groups(
-            asset_records, expected_groups, certification_type, settings,
+            records, expected_groups, certification_type, settings,
         )
-        if retry_records:
-            before = len(asset_records)
-            merged = _dedupe_asset_records(asset_records + retry_records)
-            added = len(merged) - before
-            if added > 0:
-                asset_records = merged
-                result["assetInformation"] = asset_records
-                logger.info(
-                    "Asset retry added %d new records after dedup (total now %d)",
-                    added, len(asset_records),
-                )
-            else:
-                logger.info(
-                    "Asset retry returned %d records but all were duplicates — kept initial set",
-                    len(retry_records),
-                )
+        if not retry_records:
+            return
+        merged = _dedupe_asset_records(records + retry_records)
+        added = len(merged) - len(records)
+        if added > 0:
+            result["assetInformation"] = merged
+            logger.info(
+                "Asset retry added %d new records after dedup (total now %d)",
+                added, len(merged),
+            )
+        else:
+            logger.info(
+                "Asset retry returned %d records but all were duplicates — kept initial set",
+                len(retry_records),
+            )
+
+    _retry_if_incomplete("Assets", gate=_gate, fill=_fill)
 
     return AssetExtraction.model_validate(result)
 

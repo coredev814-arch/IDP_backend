@@ -150,7 +150,8 @@ def score_pydantic_records(
         for vi in income.sourceIncome.verificationIncome:
             label = f"{vi.memberName or ''} — {vi.sourceName or ''}".strip(" —")
             scorer = RecordScorer("income", label or "Unknown")
-            for field in ("sourceName", "memberName", "rateOfPay", "frequencyOfPay",
+            for field in ("sourceName", "memberName", "selfDeclaredAmount",
+                           "rateOfPay", "frequencyOfPay",
                            "hoursPerPayPeriod", "incomeType", "employmentStatus",
                            "ytdAmount", "hireDate"):
                 val = getattr(vi, field, None)
@@ -448,6 +449,12 @@ _FIXED_INCOME_NA_FIELDS = {
     "ytdAmount", "ytdStartDate", "ytdEndDate",
 }
 
+# An income record must carry at least one of these to be usable. With none of
+# them we know the source but not how much it pays — useless for income
+# calculation or MuleSoft comparison. This invariant holds for ALL income
+# types, including fixed benefits that store the amount in rateOfPay.
+_INCOME_AMOUNT_FIELDS = ("rateOfPay", "selfDeclaredAmount", "ytdAmount", "overtimeRate")
+
 # AR-SC certifications use the TIC as the source of truth — there are NO
 # third-party verification documents (VOI, paystubs, Equifax). Every
 # wage-verification field is EXPECTED to be null. Suppress them as N/A
@@ -489,6 +496,36 @@ def _score_income_rules(card: RecordScoreCard, cert_type: str | None) -> None:
         ):
             update_field_score(card, field_name, stage="business_rule",
                                score=1.0, reason="Valid name")
+
+    # Record-level invariant: every income record needs at least one usable
+    # amount. Runs BEFORE the fixed-income / AR-SC N/A marking below so those
+    # records aren't excused — a Social Security row with no benefit figure is
+    # still a real gap. When an amount IS present (in any field), a null
+    # selfDeclaredAmount is not a gap, so mark it N/A instead of false-RED.
+    if any(vals.get(f) for f in _INCOME_AMOUNT_FIELDS):
+        for fs in card.fields:
+            if fs.field_name == "selfDeclaredAmount" and fs.value is None:
+                fs.mark_na("Amount captured in another field")
+    else:
+        update_field_score(
+            card, "selfDeclaredAmount", stage="business_rule", score=0.0,
+            reason="Income record has no amount in any field — verify source",
+        )
+
+    # selfDeclaredAmount magnitude check when present
+    sda = vals.get("selfDeclaredAmount")
+    if sda:
+        try:
+            amt = float(sda.replace(",", ""))
+            if amt <= 0:
+                update_field_score(card, "selfDeclaredAmount", stage="business_rule",
+                                   score=0.30, reason="Zero or negative amount")
+            else:
+                update_field_score(card, "selfDeclaredAmount", stage="business_rule",
+                                   score=1.0, reason="Valid amount")
+        except ValueError:
+            update_field_score(card, "selfDeclaredAmount", stage="business_rule",
+                               score=0.30, reason="Not a valid number")
 
     # AR-SC: TIC is the source of truth, no VOI/paystubs expected.
     # Mark wage-verification fields as N/A when null instead of RED.

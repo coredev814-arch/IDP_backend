@@ -1163,18 +1163,29 @@ def _generate_findings(
 
     # --- 12. Zero income worksheet needed for head of household ---
     if household and income and household.houseHold:
-        members_with_income: set[str] = set()
-        for ps in income.sourceIncome.payStub:
-            if ps.memberName:
-                members_with_income.add(ps.memberName.lower())
-        for vi in income.sourceIncome.verificationIncome:
-            if vi.memberName:
-                members_with_income.add(vi.memberName.lower())
+        # Reuse the name reconciler's own same-person notion (its similarity
+        # function AND its calibrated threshold) rather than re-deciding here.
+        # Household members are intentionally NOT renamed to canonical form, so
+        # the head can read 'Alexandra Depina' while income reads 'Alexandra R.
+        # DePina'; an exact-string check produced a false "head has no income".
+        from app.services.name_reconciler import _CLUSTER_THRESHOLD, _name_similarity
+
+        income_member_names: list[str] = [
+            ps.memberName for ps in income.sourceIncome.payStub if ps.memberName
+        ] + [
+            vi.memberName for vi in income.sourceIncome.verificationIncome if vi.memberName
+        ]
 
         for member in household.houseHold:
             if member.head == "H":
-                name = f"{(member.FirstName or '')} {(member.LastName or '')}".strip().lower()
-                if name and name not in members_with_income:
+                name = f"{(member.FirstName or '')} {(member.LastName or '')}".strip()
+                if not name:
+                    continue
+                has_income = any(
+                    _name_similarity(name, other) >= _CLUSTER_THRESHOLD
+                    for other in income_member_names
+                )
+                if not has_income:
                     findings.append(
                         f"Head of household '{member.FirstName} {member.LastName}' has no income records — "
                         f"zero income worksheet required per Section 9"

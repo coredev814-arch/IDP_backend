@@ -1,0 +1,328 @@
+# IDP — Intelligent Document Processing for Affordable-Housing Certifications
+
+IDP is a FastAPI service that audits affordable-housing tenant certifications
+(LIHTC / HUD 50059 / TIC / RD 3560-8). It performs a second, independent
+extraction of a certification packet and **reconciles it against the MuleSoft
+data already in Salesforce**, then writes a per-case audit report back to the
+Case record for a human analyst to review.
+
+---
+
+## 1. Why this exists
+
+When a tenant certification packet (often 50–60+ scanned pages) is uploaded,
+**MuleSoft** extracts structured data from it into Salesforce. MuleSoft misses
+and mislabels things. IDP is a **peer extractor**: it independently extracts the
+same packet with OCR + LLMs, runs document-level compliance checks, and then
+diffs its result against MuleSoft's.
+
+Neither side is treated as ground truth — they **supplement each other**:
+
+| | MuleSoft | IDP |
+|---|---|---|
+| Strength | Often complete coverage | Correct member identity, document compliance |
+| Weakness | Mislabels (e.g. funding-program names in the member field), duplicates | Can drop a source, OCR errors |
+
+The audit's value is the **asymmetric findings** (one side has something the
+other doesn't) plus the **compliance gates** (unsigned forms, missing Race/
+Ethnic data form, etc.) — surfaced to an analyst with a confidence score.
+
+---
+
+## 2. High-level flow
+
+```
+                Salesforce (Case + MuleSoft Certification Review)
+                                  │  webhook: case ready for audit
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  IDP service (FastAPI)                                         │
+   │                                                                │
+   │  1. Download PDF from Salesforce (ContentDocument)             │
+   │  2. IDP extraction pipeline   (OCR → classify → extract)       │
+   │  3. Pull MuleSoft data        (Salesforce SOQL)                │
+   │  4. Reconcile IDP vs MuleSoft (comparator)                     │
+   │  5. Format findings + confidence                               │
+   │  6. Write back to Case.IDP_Testing_Results__c                  │
+   └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                  Analyst reviews findings in Salesforce / dashboard
+```
+
+Each webhook returns **202 Accepted** immediately and runs the heavy work in a
+background task. State is persisted in a local SQLite **JobStore** so repeated
+signals for the same case are de-duplicated and crashed jobs can be recovered.
+
+---
+
+## 3. The IDP extraction pipeline
+
+Entry point: `app/services/pdf_service.py::process_pdf_full` →
+`app/services/pipeline.py::run_extraction_pipeline`.
+
+```
+PDF
+ └─ render pages (PyMuPDF @ 200 DPI)
+     └─ preprocess images (OpenCV → 1280×1920)
+         └─ OCR (external OCR service; Claude Vision fallback for low-quality pages)
+             └─ page_texts ──► run_extraction_pipeline:
+                 1. Two-pass classify + group        (keyword pass, then one LLM pass)
+                 2. Route document groups by category (demographics / cert / income / asset)
+                 3. LLM extraction (one call per schema):
+                      • household demographics
+                      • certification info (effective date, rent, totals, signatures…)
+                      • income sources
+                      • assets
+                 4. Income calculations (annualize each source, Section 9)
+                 5. Build document inventories (HUD forms, financial docs)
+                 6. Questionnaire disclosures + name reconciliation
+                 7. Compile compliance findings (signatures, required forms, special scenarios)
+                 8. Multi-stage field-level scoring → extraction confidence
+```
+
+LLM calls go through `app/services/llm_service.py` (Anthropic Claude). Extraction
+runs on Sonnet; classification runs on Haiku (separate capacity pool, cheaper for
+a constrained labeling task).
+
+### Self-healing retries
+
+LLM extraction is non-deterministic, so each extractor re-asks for what the first
+pass dropped. All retries share one driver, `_retry_if_incomplete` (gate → fill,
+max 1, failures swallowed so first-pass data is never lost):
+
+- **Certification info** — re-ask for critical fields that came back null.
+- **Income amounts** — a source with a name but no dollar figure triggers a
+  targeted re-ask for just those amounts.
+- **Income source coverage** — a classified benefit document (SSA / SSI / SSDI /
+  pension / child support) that produced no record of its type is re-extracted on
+  its own (grounded in a real document; never invents income to fill a gap).
+- **Assets** — when the record count is below the number of asset documents, the
+  missed documents are re-extracted.
+
+---
+
+## 4. The reconciliation (comparator)
+
+`app/services/audit/comparator.py::compare(extraction, sf_data)` diffs the IDP
+extraction against MuleSoft and returns findings + a confidence score. It compares
+four record families plus the IDP-internal findings:
+
+- **Members** — matched on (DOB, SSN last-4) with a fuzzy name fallback.
+- **Income** — matched on normalized source + member; a member-agnostic pass also
+  matches by **source + annualized amount** so MuleSoft's unreliable member field
+  (e.g. a funding-program label) doesn't break matching. Income-source synonyms
+  (SSA/SSI/SSDI/SSP/TANF) are normalized with word-boundary matching.
+- **Assets** — global best-first one-to-one assignment; balance-matching pairs
+  rank above name-only pairs so multiple same-bank accounts don't mis-pair.
+- **Certification scalars** — effective date, cert type, unit number
+  (prefix-normalized), household income total, household size, and rent
+  (reconciled the LIHTC way: gross = tenant + utility allowance).
+
+### Confidence score
+
+```
+case_confidence = extraction_score × 0.6 + agreement_rate × 0.4
+flag            = green (≥0.85) | yellow (≥0.65) | red
+```
+
+A **high-severity comparison disagreement** (e.g. a year-off effective date) caps
+the flag at **yellow** — a single critical mismatch can't be averaged into a
+false green. Zero-value/immaterial items are de-escalated to NOTES.
+
+---
+
+## 5. Output report format
+
+Findings are rendered by `app/services/audit/formatter.py` into the
+`Case.IDP_Testing_Results__c` text field, split by the *source* of the finding:
+
+```
+--- AI FILE AUDIT ---
+Case: CAS574128
+Processed: 2026-05-28
+Confidence: 81% (YELLOW)
+Findings: 5 from comparison, 1 from IDP analysis
+
+=== MULESOFT COMPARISON ===          ← IDP vs MuleSoft diffs
+[CRITICAL]
+  - ...
+[REVIEW]
+  - ...
+[NOTES]
+  - ...
+
+=== IDP ANALYSIS ===                  ← compliance / field-quality / notes
+[CRITICAL]
+  - Certification form (TIC/HUD 50059) is NOT signed — resubmission required ...
+
+---
+Stats: 4 agreements, 2 disagreements, 3 AI-only, 0 MuleSoft-only
+Extraction score: 0.90, Agreement rate: 0.67
+```
+
+Severity → bucket: `high → [CRITICAL]`, `medium → [REVIEW]`, `low/info → [NOTES]`.
+
+---
+
+## 6. HTTP API
+
+| Method & path | Purpose |
+|---|---|
+| `POST /webhook/audit-ready` | **Recommended.** MuleSoft is done → run the full chain (download → extract → compare → writeback). |
+| `POST /webhook/pdf-attached` | Legacy 2-webhook flow: start extraction only. |
+| `POST /webhook/mulesoft-done` | Legacy 2-webhook flow: run comparison once MuleSoft is done. |
+| `GET  /audit/cases` | List audit jobs from the JobStore (filter by `state`, paginated). |
+| `GET  /audit/cases/{case_id}` | Inspect one case: findings text + IDP extraction + MuleSoft data (3-panel dashboard view). |
+| `POST /admin/audit-jobs/reset` | Clear JobStore rows so cases can be re-audited (`mode`: `done` / `by_ids` / `all`). |
+| `GET  /health` | Liveness/readiness check. |
+
+**Auth:** webhooks require a bearer token matching `IDP_WEBHOOK_AUTH_TOKEN`
+(fail-closed in production; bypass only with `IDP_DEV_MODE=true` for local dev).
+
+**Webhook payload** (audit-ready / pdf-attached):
+
+```json
+{
+  "case_id": "500XXXXXXXXXXXX",
+  "case_number": "CAS574128",
+  "cert_type": "AR",                       // MI | AR | AR-SC | IR (others → 422)
+  "funding_program": "LIHTC",              // LIHTC | HUD | USDA | ...
+  "content_document_id": "069XXXXXXXXXXXX" // optional; else IDP scans the case
+}
+```
+
+---
+
+## 7. Integration modes (`IDP_AUDIT_MODE`)
+
+- `webhook` (default) — Salesforce pushes signals. Lowest latency; needs
+  Salesforce-side Apex triggers + named credentials.
+- `poll` — IDP polls Salesforce on an interval for ready cases. No SF-side setup;
+  higher latency / API load. Webhooks return 503 in this mode.
+- `both` — useful during transition.
+
+A **maintenance thread** runs in every mode: it prunes terminal JobStore rows
+older than `IDP_AUDIT_RETENTION_DAYS` and a **watchdog** re-queues cases wedged
+mid-flight after a crash/deploy (up to `IDP_AUDIT_WATCHDOG_MAX_RETRIES`).
+
+### Job lifecycle states
+
+`pending → extracting → extracted → comparing → done`
+plus terminal failure states: `extraction_failed`, `comparison_failed`,
+`mulesoft_timeout`. State is stored in SQLite at `output/audit_jobs.db`.
+
+---
+
+## 8. Project layout
+
+```
+app/
+  main.py                     FastAPI app factory + lifespan (starts poller/maintenance)
+  core/                       config (env settings), logging, exceptions, DI
+  routers/                    health, pdf (manual upload), webhook (Salesforce signals)
+  schemas/                    Pydantic models: extraction, scoring, pdf, context
+  services/
+    pdf_service.py            render → preprocess → OCR orchestration
+    ocr_service.py            external OCR client + Vision fallback
+    image_processing.py       OpenCV preprocessing
+    two_pass_classifier.py    page classification + grouping
+    extractor.py              LLM extraction per schema + self-healing retries
+    llm_service.py            Anthropic Claude wrapper (retry/backoff)
+    pipeline.py               full extraction pipeline orchestration
+    income_calculator.py      annualize income by method (Section 9)
+    field_scorer.py           multi-stage field confidence scoring
+    cross_doc_validator.py    TIC-total / consistency checks
+    name_reconciler.py        collapse name variants across records
+    validation.py             normalize money/dates/SSN; clean extraction output
+    signature_validator.py, cert_type_rules.py, special_scenarios.py,
+    bug_detector.py, questionnaire_extractor.py, inventory_builder.py, ...
+    audit/
+      comparator.py           IDP-vs-MuleSoft diff + confidence
+      formatter.py            render findings → IDP_Testing_Results__c text
+      jobs.py                 run_audit / run_extraction / run_comparison
+      job_store.py            SQLite job state (idempotency, retention)
+      poller.py               poll mode + maintenance/watchdog threads
+    salesforce/client.py      SOQL queries (cert review/members/income/assets), PDF download, writeback
+    parsers/                  questionnaire + source-name normalization
+output/                       rendered images, audit_jobs.db
+requirements.txt
+.env                          configuration (not committed)
+```
+
+---
+
+## 9. Configuration
+
+Settings load from environment variables / `.env` with the **`IDP_` prefix**
+(`app/core/config.py`). Key ones:
+
+```bash
+# LLM (Anthropic Claude)
+IDP_ANTHROPIC_API_KEY=sk-ant-...
+IDP_LLM_MODEL=claude-sonnet-4-20250514
+IDP_LLM_CLASSIFY_MODEL=claude-haiku-4-5-20251001
+
+# OCR service (external)
+IDP_OCR_SERVICE_URL=https://...
+IDP_OCR_FALLBACK_URL=https://...
+IDP_OCR_VISION_THRESHOLD=0.5        # below this OCR score → Claude Vision
+
+# Salesforce
+IDP_SF_USERNAME=...
+IDP_SF_PASSWORD=...
+IDP_SF_TOKEN=...
+IDP_SF_DOMAIN=us-hc.my
+
+# Webhooks / mode
+IDP_WEBHOOK_AUTH_TOKEN=...          # required in production
+IDP_DEV_MODE=false                  # true bypasses webhook auth (local only)
+IDP_AUDIT_MODE=webhook              # webhook | poll | both
+
+# Job store / housekeeping
+IDP_AUDIT_JOB_DB=output/audit_jobs.db
+IDP_AUDIT_RETENTION_DAYS=7
+IDP_MIN_PDF_PAGES=4                 # smaller PDFs rejected as non-source docs
+```
+
+See `app/core/config.py` for the full list (rendering DPI, OCR concurrency,
+watchdog/poll intervals, etc.).
+
+---
+
+## 10. Running locally
+
+```bash
+# 1. Install dependencies (Python 3.11+)
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Configure — create a .env file with the IDP_* values above
+#   (for local dev without webhook auth: set IDP_DEV_MODE=true)
+
+# 3. Run the API
+uvicorn app.main:app --reload --port 8000
+
+# 4. Smoke-test a webhook (dev mode)
+curl -X POST http://localhost:8000/webhook/audit-ready \
+  -H "Content-Type: application/json" \
+  -d '{"case_id":"500...","case_number":"CAS000001","cert_type":"AR","funding_program":"LIHTC"}'
+
+# 5. Inspect the result
+curl http://localhost:8000/audit/cases/500...
+```
+
+Requires a reachable OCR service, valid Anthropic + Salesforce credentials. PDFs
+under `IDP_MIN_PDF_PAGES` (default 4) are rejected as non-source documents.
+
+---
+
+## 11. Glossary
+
+- **TIC** — Tenant Income Certification.
+- **HUD 50059 / RD 3560-8** — agency certification forms.
+- **Cert types** — `MI` (move-in), `AR` (annual recert), `AR-SC` (annual
+  self-certification), `IR` (interim recert).
+- **Gross rent (LIHTC)** — tenant-paid rent + utility allowance.
+- **MuleSoft** — the upstream integration that extracts packet data into
+  Salesforce; IDP audits its output.

@@ -89,6 +89,33 @@ def _close(a: float, b: float, tolerance: float = 0.05) -> bool:
     return abs(a - b) / max(abs(a), abs(b)) < tolerance
 
 
+# Policy thresholds for escalating a dollar-amount mismatch to CRITICAL.
+# These are POLICY defaults, not values derived from any single sample — tune
+# against real audit volume. Both gates must hold so a modest percentage on a
+# big number AND a big percentage on a trivial number both stay REVIEW.
+_MISMATCH_REL_GAP = 0.25       # relative gap (|a-b| / larger) at/above this, AND
+_MISMATCH_ABS_GAP = 1000.0     # absolute gap (dollars) at/above this -> CRITICAL
+
+
+def _value_mismatch_severity(
+    a: float, b: float,
+    *, rel_high: float = _MISMATCH_REL_GAP, abs_high: float = _MISMATCH_ABS_GAP,
+) -> str:
+    """Severity for a dollar-amount mismatch, escalated by magnitude.
+
+    A large gap on a material amount is CRITICAL ("high"); everything else is
+    "medium". e.g. $2,380 vs $55,884 (96%, $53k) -> high; $172 vs $272
+    (37%, $99) -> medium. Thresholds are module-level policy (see above).
+    """
+    hi = max(abs(a), abs(b))
+    if hi <= 0:
+        return "medium"
+    rel = abs(a - b) / hi
+    if rel >= rel_high and abs(a - b) >= abs_high:
+        return "high"
+    return "medium"
+
+
 # ---------------------------------------------------------------------------
 # Synonym tables — map AI extraction names to MuleSoft's abbreviations.
 # Both sides get normalized to a canonical form before comparison.
@@ -135,10 +162,19 @@ def _normalize_income_source(name: str | None) -> str:
         return ""
     if raw in _INCOME_SOURCE_SYNONYMS:
         return _INCOME_SOURCE_SYNONYMS[raw]
-    # Substring fallback — handle "Massachusetts SSP", "MA SSI", etc.
-    for synonym, canonical in _INCOME_SOURCE_SYNONYMS.items():
-        if synonym in raw or raw in synonym:
-            return canonical
+    # Word-boundary fallback — handle "Massachusetts SSP", "MA SSI", etc.
+    # A single-word synonym must match a WHOLE token (never an arbitrary
+    # substring — otherwise 'ss' inside 'ssi' would wrongly map SSI → Social
+    # Security). A multi-word synonym must appear as a contiguous phrase.
+    # Longest synonyms first so the most specific one wins.
+    raw_tokens = {t for t in re.split(r"[^a-z0-9]+", raw) if t}
+    for synonym in sorted(_INCOME_SOURCE_SYNONYMS, key=len, reverse=True):
+        syn_tokens = [t for t in re.split(r"[^a-z0-9]+", synonym) if t]
+        if len(syn_tokens) == 1:
+            if syn_tokens[0] in raw_tokens:
+                return _INCOME_SOURCE_SYNONYMS[synonym]
+        elif synonym in raw:
+            return _INCOME_SOURCE_SYNONYMS[synonym]
     return raw
 
 
@@ -343,7 +379,9 @@ def _member_name_key(rec: dict) -> str:
     return f"{first} {last}".strip()
 
 
-def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[list[Finding], dict]:
+def _compare_members(
+    ai_members: list[dict], sf_members: list[dict], *, ir_scoped: bool = False,
+) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
 
     # SF dedup: warn on duplicates within SF
@@ -445,17 +483,24 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
     for k in sf_only:
         m = sf_keys[k][0]
         name = f"{m.get('First_Name__c', '')} {m.get('Last_Name__c', '')}".strip()
-        findings.append(Finding(
-            category=IDP_MISSED_MEMBER,
-            severity="medium",
-            message=(
+        if ir_scoped:
+            sev, msg = "info", (
+                f"{name} is in MuleSoft's full-case record but not the interim "
+                f"packet — verify if changed (IR)"
+            )
+        else:
+            sev, msg = "medium", (
                 f"AI may have missed household member — {name} "
                 f"is in MuleSoft but not in AI extraction"
-            ),
+            )
+        findings.append(Finding(
+            category=IDP_MISSED_MEMBER,
+            severity=sev,
+            message=msg,
             detail={"name": name, "ssn4": k[1]},
         ))
 
-    # Value mismatch on matched members (Disabled / Student)
+    # Value mismatch on matched members (Disabled / Head)
     for k in matched:
         ai_m = ai_keys[k]
         sf_m = sf_keys[k][0]
@@ -468,6 +513,25 @@ def _compare_members(ai_members: list[dict], sf_members: list[dict]) -> tuple[li
                 message=(
                     f"Disability mismatch — {ai_m.get('FirstName')} {ai_m.get('LastName')}: "
                     f"AI={ai_dis} MuleSoft={sf_dis}"
+                ),
+            ))
+
+        # Head-of-household disagreement. IDP marks head with "H"; MuleSoft
+        # uses a boolean Head__c. The two systems disagreeing on who heads the
+        # household is worth surfacing (it shifts income/asset attribution and
+        # which member the cert is built around). Only flag when MuleSoft has a
+        # definite value.
+        ai_head = "y" if _norm(ai_m.get("head")) in ("h", "y", "head", "1", "true") else "n"
+        sf_head_raw = sf_m.get("Head__c")
+        sf_head = "y" if sf_head_raw else "n" if sf_head_raw is False else ""
+        if sf_head and ai_head != sf_head:
+            findings.append(Finding(
+                category=VALUE_MISMATCH,
+                severity="medium",
+                message=(
+                    f"Head-of-household mismatch — {ai_m.get('FirstName')} {ai_m.get('LastName')}: "
+                    f"AI={'head' if ai_head == 'y' else 'not head'} "
+                    f"MuleSoft={'head' if sf_head == 'y' else 'not head'}"
                 ),
             ))
 
@@ -501,6 +565,7 @@ def _income_key(rec: dict) -> tuple[str, str]:
 
 def _compare_income(
     ai_income: list[dict], ai_calculations: list[dict], sf_income: list[dict],
+    *, ir_scoped: bool = False,
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
 
@@ -536,6 +601,36 @@ def _compare_income(
     matched = ai_keys & set(sf_keys.keys())
     ai_only_keys = ai_keys - set(sf_keys.keys())
     sf_only_keys = set(sf_keys.keys()) - ai_keys
+
+    # Amount-based matching (member-agnostic). MuleSoft's member field is
+    # unreliable — it sometimes holds a funding-program label ('LIHTC', 'HUD')
+    # instead of a person — so a record can fail the (source, member) key match
+    # even when source + annual amount clearly agree. Pair leftover records by
+    # normalized source + close annual amount, ignoring member; the member
+    # difference is surfaced as a low-severity note, not a false missing/missed.
+    amount_pairs: list[tuple[tuple[str, str], tuple[str, str]]] = []
+    amount_matched_ai: set[tuple[str, str]] = set()
+    amount_matched_sf: set[tuple[str, str]] = set()
+    for ai_k in ai_only_keys:
+        if not ai_k[0]:
+            continue
+        ai_amt = ai_annual.get(ai_k)
+        if ai_amt is None or ai_amt <= 0:
+            continue
+        for sf_k in sf_only_keys:
+            if sf_k in amount_matched_sf or sf_k[0] != ai_k[0]:
+                continue
+            sf_amt = _money(sf_keys[sf_k][0].get("Gross_Member_Income__c"))
+            # Same tolerance the exact-match income comparison uses (0.01),
+            # not the asset tolerance — keep one income-amount tolerance.
+            if sf_amt is not None and sf_amt > 0 and _close(ai_amt, sf_amt, tolerance=0.01):
+                amount_matched_ai.add(ai_k)
+                amount_matched_sf.add(sf_k)
+                amount_pairs.append((ai_k, sf_k))
+                break
+
+    ai_only_keys = ai_only_keys - amount_matched_ai
+    sf_only_keys = sf_only_keys - amount_matched_sf
 
     # Fuzzy-match remaining AI-only and SF-only sources by name similarity.
     # Catches employer name variants like:
@@ -592,7 +687,7 @@ def _compare_income(
                 disagreements += 1
                 findings.append(Finding(
                     category=VALUE_MISMATCH,
-                    severity="medium",
+                    severity=_value_mismatch_severity(ai_amt, sf_amt),
                     message=(
                         f"INCOME MISMATCH — {sf_keys[k][0].get('Source_Name__c')}: "
                         f"AI ${ai_amt:,.2f} vs MuleSoft ${sf_amt:,.2f}"
@@ -623,7 +718,7 @@ def _compare_income(
             disagreements += 1
             findings.append(Finding(
                 category=VALUE_MISMATCH,
-                severity="medium",
+                severity=_value_mismatch_severity(ai_amt, sf_amt),
                 message=(
                     f"INCOME MISMATCH — '{sf_rec.get('Source_Name__c')}' "
                     f"(matched to AI '{ai_k[0]}'): "
@@ -647,6 +742,24 @@ def _compare_income(
                 ),
             ))
 
+    # Amount-matched pairs are agreements by construction (same source, close
+    # annual amount). Surface the member difference so the analyst can see when
+    # MuleSoft's member field is wrong (e.g. 'LIHTC'/'HUD' instead of a person).
+    for ai_k, sf_k in amount_pairs:
+        agreements += 1
+        ai_member = ai_k[1]
+        sf_member = sf_k[1]
+        if ai_member and sf_member and ai_member != sf_member:
+            findings.append(Finding(
+                category=VALUE_MISMATCH,
+                severity="low",
+                message=(
+                    f"Income member differs — '{ai_k[0]}': AI member "
+                    f"'{ai_member}' vs MuleSoft '{sf_member}' "
+                    f"(matched by source + amount)"
+                ),
+            ))
+
     # AI-only — drop empty source names (useless finding "MuleSoft missing ''")
     ai_only_clean = {k for k in ai_only if k[0]}
     for k in ai_only_clean:
@@ -662,7 +775,14 @@ def _compare_income(
     for cluster in sf_only_clusters:
         rep = cluster[0]
         member = rep[1] or "household"
-        if len(cluster) > 1:
+        if ir_scoped:
+            sev = "info"
+            msg = (
+                f"Income source '{rep[0]}' for {member} is in MuleSoft's "
+                f"full-case record, not the interim packet — verify if changed (IR)"
+            )
+        elif len(cluster) > 1:
+            sev = "medium"
             variants = ", ".join(f"'{k[0]}'" for k in cluster[:3])
             if len(cluster) > 3:
                 variants += f", +{len(cluster) - 3} more"
@@ -671,10 +791,11 @@ def _compare_income(
                 f"(MuleSoft has {len(cluster)} variant spellings: {variants})"
             )
         else:
+            sev = "medium"
             msg = f"AI may have missed income source — '{rep[0]}' for {member}"
         findings.append(Finding(
             category=IDP_MISSED_INCOME,
-            severity="medium",
+            severity=sev,
             message=msg,
         ))
 
@@ -690,6 +811,33 @@ def _compare_income(
 # Asset comparison
 # ---------------------------------------------------------------------------
 
+# MuleSoft stores an asset's balance/value across several fields depending on
+# how it was verified (VOA, bank statement, self-declaration, real estate).
+# Reading only Cash_Value__c/VOA_Current__c silently drops assets whose balance
+# lives elsewhere — they look like null-balance orphans and get filtered out
+# before comparison. Read all of them, most-canonical first.
+_SF_ASSET_BALANCE_FIELDS = (
+    "Cash_Value__c",
+    "VOA_Current__c",
+    "VOA_Cash_Value__c",
+    "Asset_Cash_Value__c",
+    "Recent_Bank_Statement_Balance__c",
+    "Self_Declared_Balance__c",
+    "VOA_Net_Value__c",
+    "Net_Value_of_Real_Estate__c",
+    "Current_Market_Value__c",
+)
+
+
+def _sf_asset_balance(rec: dict) -> float | None:
+    """First populated balance/value across MuleSoft's asset balance fields."""
+    for f in _SF_ASSET_BALANCE_FIELDS:
+        val = _money(rec.get(f))
+        if val is not None:
+            return val
+    return None
+
+
 def _asset_key(rec: dict) -> tuple[str, str, str]:
     """sourceName + accountType + last 4 of accountNumber."""
     src = _norm(rec.get("sourceName") or rec.get("Source_Name__c"))
@@ -697,15 +845,16 @@ def _asset_key(rec: dict) -> tuple[str, str, str]:
     acct_num = str(rec.get("accountNumber") or "").strip()
     if not acct_num:
         # Fall back to a balance-based stub for SF records without account #
-        bal = (rec.get("Cash_Value__c") or rec.get("VOA_Current__c") or
-               rec.get("currentBalance") or "")
-        acct_num = f"~{bal}"
+        bal = _sf_asset_balance(rec)
+        if bal is None:
+            bal = _money(rec.get("currentBalance"))
+        acct_num = f"~{bal}" if bal is not None else "~"
     last4 = acct_num[-4:].lower() if len(acct_num) >= 4 else acct_num.lower()
     return (src, acct_type, last4)
 
 
 def _compare_assets(
-    ai_assets: list[dict], sf_assets: list[dict],
+    ai_assets: list[dict], sf_assets: list[dict], *, ir_scoped: bool = False,
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
 
@@ -717,7 +866,7 @@ def _compare_assets(
     for a in sf_assets:
         has_source = bool((a.get("Source_Name__c") or "").strip())
         has_account = bool((a.get("accountNumber") or "").strip())
-        has_balance = _money(a.get("Cash_Value__c") or a.get("VOA_Current__c"))
+        has_balance = _sf_asset_balance(a)
         if not has_source and not has_account and not has_balance:
             sf_orphan_count += 1
             continue
@@ -758,74 +907,62 @@ def _compare_assets(
     fuzzy_matched_sf_assets: set[tuple] = set()
     asset_fuzzy_pairs: list[tuple[tuple, tuple]] = []
 
+    # Score EVERY candidate (ai, sf) pair, then assign globally best-first
+    # (one-to-one). A per-record greedy match mis-pairs when several accounts
+    # share a bank name: e.g. two Checking accounts at the same bank, only one
+    # of which matches MuleSoft's balance — greedy could claim MuleSoft's
+    # record for the WRONG account, leaving the true match flagged "MuleSoft
+    # missing" and inventing a balance mismatch. Scoring ranks balance-matching
+    # pairs ABOVE name-only pairs so the balance-correct pairing always wins;
+    # same-name/different-balance is a last resort, taken only if nothing
+    # better claims that record (then it surfaces as a real balance mismatch).
     sf_only_list = list(sf_only_keys)
+    candidates: list[tuple[float, tuple, tuple]] = []
     for ai_k in ai_only_keys:
         ai_rec = ai_keys[ai_k]
         ai_src_norm = _normalize_org_name(ai_k[0])
         ai_type = ai_k[1]
         ai_bal = _money(ai_rec.get("currentBalance"))
         if not ai_src_norm and ai_bal is None:
-            continue   # nothing to fuzzy-match on
-
-        best_score = 0.0
-        best_sf_k: tuple | None = None
+            continue   # nothing to match on
         for sf_k in sf_only_list:
-            if sf_k in fuzzy_matched_sf_assets:
-                continue
             sf_rec = sf_keys[sf_k][0]
             sf_src_norm = _normalize_org_name(sf_k[0])
-            sf_bal = _money(
-                sf_rec.get("Cash_Value__c") or sf_rec.get("VOA_Current__c")
-            )
-            # accountType compatibility ('Checking' ≈ 'Checking Account',
-            # 'Investment' ≈ 'Brokerage'). NOT a hard filter — AI and MuleSoft
-            # often disagree on type (e.g. AI labels "Direct Express" as the
-            # type while MuleSoft labels it "Other"). Gates looser matches
-            # below; bypassed for near-perfect (≥0.95) name matches.
+            sf_bal = _sf_asset_balance(sf_rec)
             type_ok = _account_types_compatible(ai_type, sf_k[1])
-
-            # Score = combination of name similarity and balance match.
-            # Use _name_similarity (full-string + per-token) to catch
-            # "Knights of Columbus" ↔ "4633 KOC" via balance, and
-            # "Walt Disney" ↔ "The Walt Disney Company" via tokens.
-            name_score = 0.0
-            if ai_src_norm and sf_src_norm:
-                name_score = _name_similarity(ai_src_norm, sf_src_norm)
+            name_score = (
+                _name_similarity(ai_src_norm, sf_src_norm)
+                if (ai_src_norm and sf_src_norm) else 0.0
+            )
+            names_ok = name_score >= 0.85 or not ai_src_norm or not sf_src_norm
             balance_match = (
                 ai_bal is not None and sf_bal is not None
                 and _close(ai_bal, sf_bal, tolerance=0.02)
             )
+            balance_conflict = (
+                ai_bal is not None and sf_bal is not None and not balance_match
+            )
 
-            # Near-perfect name match: same asset regardless of balance OR
-            # account type. MuleSoft sometimes leaves Cash_Value__c as 0/null
-            # even when AI extracted a real balance — and type strings often
-            # disagree between systems. Surface as a value mismatch rather
-            # than two missing/missed entries.
-            if name_score >= 0.95:
-                if name_score > best_score:
-                    best_score = name_score
-                    best_sf_k = sf_k
-                    continue
-            # Below 0.95, looser matches require accountType compatibility to
-            # avoid false positives (otherwise unrelated assets with similar
-            # balances would fuzzy-match across types).
-            if not type_ok:
+            # Tiered score — higher tier wins regardless of name nuance:
+            if balance_match and type_ok and names_ok:
+                score = 3.0 + name_score            # balances agree — most reliable
+            elif name_score >= 0.95 and not balance_conflict:
+                score = 2.0 + name_score            # near-perfect name, no contradiction
+            elif name_score >= 0.85 and type_ok and not balance_conflict:
+                score = 1.0 + name_score            # moderate name, no contradiction
+            elif name_score >= 0.95 and balance_conflict:
+                score = name_score                  # same name, diff balance — last resort
+            else:
                 continue
-            # Strong match: balance matches AND (name similar OR one source is empty)
-            if balance_match and (name_score >= 0.85 or not ai_src_norm or not sf_src_norm):
-                if name_score > best_score:
-                    best_score = max(name_score, 0.86)
-                    best_sf_k = sf_k
-            # Moderate match: name very similar AND no balance contradiction
-            elif name_score >= 0.85 and (ai_bal is None or sf_bal is None or balance_match):
-                if name_score > best_score:
-                    best_score = name_score
-                    best_sf_k = sf_k
+            candidates.append((score, ai_k, sf_k))
 
-        if best_score >= 0.85 and best_sf_k is not None:
-            fuzzy_matched_ai_assets.add(ai_k)
-            fuzzy_matched_sf_assets.add(best_sf_k)
-            asset_fuzzy_pairs.append((ai_k, best_sf_k))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    for _score, ai_k, sf_k in candidates:
+        if ai_k in fuzzy_matched_ai_assets or sf_k in fuzzy_matched_sf_assets:
+            continue
+        fuzzy_matched_ai_assets.add(ai_k)
+        fuzzy_matched_sf_assets.add(sf_k)
+        asset_fuzzy_pairs.append((ai_k, sf_k))
 
     ai_only = ai_only_keys - fuzzy_matched_ai_assets
     sf_only = sf_only_keys - fuzzy_matched_sf_assets
@@ -835,8 +972,7 @@ def _compare_assets(
 
     for k in matched:
         ai_bal = _money(ai_keys[k].get("currentBalance"))
-        sf_bal = _money(sf_keys[k][0].get("Cash_Value__c") or
-                        sf_keys[k][0].get("VOA_Current__c"))
+        sf_bal = _sf_asset_balance(sf_keys[k][0])
         if ai_bal is not None and sf_bal is not None:
             if _close(ai_bal, sf_bal, tolerance=0.02):
                 agreements += 1
@@ -844,7 +980,7 @@ def _compare_assets(
                 disagreements += 1
                 findings.append(Finding(
                     category=VALUE_MISMATCH,
-                    severity="medium",
+                    severity=_value_mismatch_severity(ai_bal, sf_bal),
                     message=(
                         f"ASSET BALANCE MISMATCH — "
                         f"{sf_keys[k][0].get('Source_Name__c')} "
@@ -866,9 +1002,7 @@ def _compare_assets(
         ai_src = ai_rec.get("sourceName") or "(unnamed)"
         sf_src = sf_rec.get("Source_Name__c") or "(unnamed)"
         ai_bal = _money(ai_rec.get("currentBalance"))
-        sf_bal = _money(
-            sf_rec.get("Cash_Value__c") or sf_rec.get("VOA_Current__c")
-        )
+        sf_bal = _sf_asset_balance(sf_rec)
 
         # Determine the right phrasing
         if ai_src.lower() != sf_src.lower():
@@ -887,7 +1021,7 @@ def _compare_assets(
         if balance_diff:
             findings.append(Finding(
                 category=VALUE_MISMATCH,
-                severity="medium",
+                severity=_value_mismatch_severity(ai_bal, sf_bal),
                 message=(
                     f"ASSET BALANCE MISMATCH — '{sf_src}' "
                     f"({sf_rec.get('Account_Type__c') or ai_rec.get('accountType')}): "
@@ -905,12 +1039,20 @@ def _compare_assets(
     ai_only_clean = {k for k in ai_only if (k[0] or k[2])}
     for k in ai_only_clean:
         rec = ai_keys[k]
+        bal = _money(rec.get("currentBalance"))
+        if bal is None:
+            bal = _money(rec.get("selfDeclaredAmount"))
+        # A zero-value asset carries nothing material — surface as a NOTE, not
+        # a CRITICAL, so an empty placeholder (e.g. 'Self-Declared Cash $0.00')
+        # doesn't head the analyst's critical list. Unknown balance (None) is
+        # kept as high — it might be material, we just couldn't read it.
+        severity = "info" if bal == 0 else "high"
         findings.append(Finding(
             category=MISSING_ASSET,
-            severity="high",
+            severity=severity,
             message=(
                 f"MuleSoft missing asset — '{rec.get('sourceName')}' "
-                f"({rec.get('accountType')}) ${_money(rec.get('currentBalance')) or 0:,.2f}"
+                f"({rec.get('accountType')}) ${bal or 0:,.2f}"
             ),
         ))
 
@@ -920,7 +1062,15 @@ def _compare_assets(
     for cluster in sf_only_clusters:
         rep_key = cluster[0]
         rep_rec = sf_keys[rep_key][0]
-        if len(cluster) > 1:
+        rep_bal = _sf_asset_balance(rep_rec)
+        if ir_scoped:
+            severity = "info"
+            msg = (
+                f"Asset '{rep_rec.get('Source_Name__c')}' is in MuleSoft's "
+                f"full-case record, not the interim packet — verify if changed (IR)"
+            )
+        elif len(cluster) > 1:
+            severity = "medium"
             variants = ", ".join(
                 f"'{sf_keys[k][0].get('Source_Name__c')}'" for k in cluster[:3]
             )
@@ -931,13 +1081,15 @@ def _compare_assets(
                 f"is in MuleSoft ({len(cluster)} variant spellings: {variants})"
             )
         else:
+            # Single zero-value MuleSoft asset is immaterial — NOTE, not REVIEW.
+            severity = "info" if rep_bal == 0 else "medium"
             msg = (
                 f"AI may have missed asset — '{rep_rec.get('Source_Name__c')}' "
                 f"is in MuleSoft"
             )
         findings.append(Finding(
             category=IDP_MISSED_ASSET,
-            severity="medium",
+            severity=severity,
             message=msg,
         ))
 
@@ -946,6 +1098,133 @@ def _compare_assets(
         "disagreements": disagreements,
         "ai_only": len(ai_only_clean),
         "sf_only": len(sf_only_clusters),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Certification-level scalar comparison
+# ---------------------------------------------------------------------------
+
+def _norm_unit(v: Any) -> str:
+    """Normalize a unit number so building/floor prefixes don't cause false
+    mismatches: '1 501' → '501', 'Bldg 2 Unit 27' → '27', '#27' → '27'.
+
+    Takes the last alphanumeric token, which is the unit itself.
+    """
+    raw = _norm(v)
+    if not raw:
+        return ""
+    tokens = [t for t in re.split(r"[\s\-#/]+", raw) if t]
+    return tokens[-1] if tokens else raw
+
+
+def _compare_certification(
+    ai_cert: dict, sf_review: dict | None,
+) -> tuple[list[Finding], dict]:
+    """Cross-check certification-level scalar fields between IDP and MuleSoft.
+
+    These fields (effective date, cert type, unit, income total, rent) are
+    never record-matched by the other _compare_* functions. Without this check
+    a field that disagrees between the two systems is simply invisible — which
+    is how a cert with a year-off effective date can score a false GREEN. Each
+    compared field counts toward agreement/disagreement so a real mismatch
+    actually moves the confidence needle, not just appends a finding.
+
+    Only fields present on BOTH sides are scored (one-sided fields aren't a
+    cross-system disagreement). Numeric fields use tolerance; the unit number
+    is prefix-normalized; rent is reconciled the LIHTC way (see below).
+    """
+    findings: list[Finding] = []
+    agreements = 0
+    disagreements = 0
+
+    if not ai_cert or not sf_review:
+        return findings, {"agreements": 0, "disagreements": 0, "ai_only": 0, "sf_only": 0}
+
+    def _emit(ok: bool, finding: Finding | None) -> None:
+        nonlocal agreements, disagreements
+        if ok:
+            agreements += 1
+        elif finding is not None:
+            disagreements += 1
+            findings.append(finding)
+
+    # --- Effective date (date-only, exact) ---
+    ai_eff = str(ai_cert.get("effectiveDate") or "")[:10]
+    sf_eff = str(sf_review.get("Effective_Date__c") or "")[:10]
+    if ai_eff and sf_eff:
+        _emit(ai_eff == sf_eff, Finding(
+            category=VALUE_MISMATCH, severity="high",
+            message=f"EFFECTIVE DATE MISMATCH — AI {ai_eff} vs MuleSoft {sf_eff}",
+            detail={"field": "effectiveDate", "ai": ai_eff, "sf": sf_eff},
+        ))
+
+    # --- Certification type (case-insensitive, exact) ---
+    ai_ct = _norm(ai_cert.get("certificationType"))
+    sf_ct = _norm(sf_review.get("Certification_Type__c"))
+    if ai_ct and sf_ct:
+        _emit(ai_ct == sf_ct, Finding(
+            category=VALUE_MISMATCH, severity="medium",
+            message=f"CERT TYPE MISMATCH — AI '{ai_ct.upper()}' vs MuleSoft '{sf_ct.upper()}'",
+        ))
+
+    # --- Unit number (prefix-normalized) ---
+    ai_unit = _norm_unit(ai_cert.get("unitNumber"))
+    sf_unit = _norm_unit(sf_review.get("Unit_Number__c"))
+    if ai_unit and sf_unit:
+        _emit(ai_unit == sf_unit, Finding(
+            category=VALUE_MISMATCH, severity="low",
+            message=(f"UNIT NUMBER MISMATCH — AI '{ai_cert.get('unitNumber')}' "
+                     f"vs MuleSoft '{sf_review.get('Unit_Number__c')}'"),
+        ))
+
+    # --- Household income total (numeric, 5% tolerance) ---
+    # Catches MuleSoft over/under-count (e.g. a duplicated income source
+    # inflating Total_Income__c above the TIC-declared household income).
+    ai_inc = _money(ai_cert.get("householdIncome"))
+    sf_inc = _money(sf_review.get("Total_Income__c")
+                    or sf_review.get("Total_Gross_Household_Income__c"))
+    if ai_inc is not None and sf_inc is not None and (ai_inc > 0 or sf_inc > 0):
+        _emit(_close(ai_inc, sf_inc, tolerance=0.05), Finding(
+            category=VALUE_MISMATCH,
+            severity=_value_mismatch_severity(ai_inc, sf_inc),
+            message=(f"HOUSEHOLD INCOME MISMATCH — AI ${ai_inc:,.2f} "
+                     f"vs MuleSoft ${sf_inc:,.2f}"),
+            detail={"field": "householdIncome", "ai": ai_inc, "sf": sf_inc},
+        ))
+
+    # --- Household size (integer) ---
+    ai_sz = _money(ai_cert.get("householdSize"))
+    sf_sz = _money(sf_review.get("Number_Members__c"))
+    if ai_sz is not None and sf_sz is not None:
+        _emit(int(ai_sz) == int(sf_sz), Finding(
+            category=VALUE_MISMATCH, severity="medium",
+            message=f"HOUSEHOLD SIZE MISMATCH — AI {int(ai_sz)} vs MuleSoft {int(sf_sz)}",
+        ))
+
+    # --- Rent reconciliation (LIHTC: gross rent = tenant rent + utility allowance) ---
+    # MuleSoft 'Gross_Rent__c' is the LIHTC gross (tenant + UA), so reconcile it
+    # against IDP's tenantRent + utilityAllowance — NOT IDP's grossRent field,
+    # which is often the contract/market rent (a different concept that would
+    # false-flag).
+    sf_gross = _money(sf_review.get("Gross_Rent__c"))
+    ai_tenant = _money(ai_cert.get("tenantRent"))
+    ai_ua = _money(ai_cert.get("utilityAllowance"))
+    if sf_gross is not None and sf_gross > 0 and ai_tenant is not None and ai_ua is not None:
+        ai_gross_equiv = ai_tenant + ai_ua
+        _emit(_close(ai_gross_equiv, sf_gross, tolerance=0.02), Finding(
+            category=VALUE_MISMATCH,
+            severity=_value_mismatch_severity(ai_gross_equiv, sf_gross),
+            message=(f"GROSS RENT MISMATCH — AI ${ai_gross_equiv:,.2f} "
+                     f"(tenant ${ai_tenant:,.2f} + utility ${ai_ua:,.2f}) "
+                     f"vs MuleSoft ${sf_gross:,.2f}"),
+        ))
+
+    return findings, {
+        "agreements": agreements,
+        "disagreements": disagreements,
+        "ai_only": 0,
+        "sf_only": 0,
     }
 
 
@@ -1050,37 +1329,67 @@ def _idp_internal_findings(extraction: dict) -> list[Finding]:
 # Confidence score
 # ---------------------------------------------------------------------------
 
+# Minimum extraction score for an IR to be treated as a legitimately-scoped
+# packet (rather than a failed extraction). Below this, MuleSoft-only records
+# are penalized normally so genuine failures stay RED.
+# POLICY default, not sample-derived — this is the value most worth calibrating
+# against the real distribution of IR extraction scores once volume exists.
+_IR_HEALTHY_EXTRACTION = 0.6
+
+
 def _calculate_confidence(
     extraction: dict,
     member_stats: dict, income_stats: dict, asset_stats: dict,
+    cert_stats: dict,
+    comparison_findings: list[Finding],
+    ir_scoped: bool = False,
 ) -> Confidence:
     field_scores = extraction.get("field_scores") or {}
     extraction_score = float(field_scores.get("overall_composite") or 0.0)
 
     agreements = (member_stats["agreements"] + income_stats["agreements"]
-                  + asset_stats["agreements"])
+                  + asset_stats["agreements"] + cert_stats["agreements"])
     disagreements = (member_stats["disagreements"] + income_stats["disagreements"]
-                     + asset_stats["disagreements"])
+                     + asset_stats["disagreements"] + cert_stats["disagreements"])
     ai_only = (member_stats["ai_only"] + income_stats["ai_only"]
-               + asset_stats["ai_only"])
+               + asset_stats["ai_only"] + cert_stats["ai_only"])
     sf_only = (member_stats["sf_only"] + income_stats["sf_only"]
-               + asset_stats["sf_only"])
+               + asset_stats["sf_only"] + cert_stats["sf_only"])
 
-    # Don't penalize "AI catches MuleSoft miss"; do penalize disagreements
-    # and "AI missed something MuleSoft has".
-    weight = agreements + disagreements + (sf_only * 0.5)
-    if weight > 0:
-        rate = (agreements - 0.5 * sf_only) / weight
-        agreement_rate = max(0.0, min(1.0, rate))
+    if ir_scoped:
+        # Scoped IR (gated on healthy extraction in compare()): MuleSoft-only
+        # records reflect the full case, not an IDP miss, so exclude them from
+        # the rate entirely — neither penalty nor weight.
+        weight = agreements + disagreements
+        if weight > 0:
+            agreement_rate = max(0.0, min(1.0, agreements / weight))
+        else:
+            agreement_rate = 1.0 if (agreements or ai_only) else 0.5
     else:
-        # No comparable records (MuleSoft has nothing) — confidence
-        # rests on extraction quality alone.
-        agreement_rate = 1.0 if ai_only > 0 else 0.5
+        # Don't penalize "AI catches MuleSoft miss"; do penalize disagreements
+        # and "AI missed something MuleSoft has".
+        weight = agreements + disagreements + (sf_only * 0.5)
+        if weight > 0:
+            rate = (agreements - 0.5 * sf_only) / weight
+            agreement_rate = max(0.0, min(1.0, rate))
+        else:
+            # No comparable records (MuleSoft has nothing) — confidence
+            # rests on extraction quality alone.
+            agreement_rate = 1.0 if ai_only > 0 else 0.5
 
     case_confidence = (extraction_score * 0.6) + (agreement_rate * 0.4)
     flag = ("green" if case_confidence >= 0.85
             else "yellow" if case_confidence >= 0.65
             else "red")
+
+    # Severity cap: a single high-severity cross-system disagreement (e.g. a
+    # year-off effective date, a duplicated income source, a member MuleSoft is
+    # missing) must never read GREEN, even when the averaged score is high. The
+    # average washes out lone-but-critical mismatches, which is exactly how a
+    # bad cert slips through as green. Only COMPARISON findings cap the flag —
+    # IDP-internal compliance/field-quality findings are scored separately.
+    if flag == "green" and any(f.severity == "high" for f in comparison_findings):
+        flag = "yellow"
 
     return Confidence(
         extraction_score=extraction_score,
@@ -1104,21 +1413,48 @@ def compare(extraction: dict, sf_data: dict) -> ComparisonResult:
     ai_income = ((extraction.get("income") or {}).get("sourceIncome") or {}).get("verificationIncome") or []
     ai_calculations = extraction.get("income_calculations") or []
     ai_assets = (extraction.get("assets") or {}).get("assetInformation") or []
+    ai_cert = extraction.get("certification_info") or {}
 
     sf_members = sf_data.get("members") or []
     sf_income = sf_data.get("income") or []
     sf_assets = sf_data.get("assets") or []
+    sf_review = sf_data.get("review")
 
-    member_findings, member_stats = _compare_members(ai_members, sf_members)
-    income_findings, income_stats = _compare_income(ai_income, ai_calculations, sf_income)
-    asset_findings, asset_stats = _compare_assets(ai_assets, sf_assets)
+    # Interim Recertification packets are scoped to the change that triggered
+    # them, so MuleSoft holding more records than IDP is EXPECTED — not an IDP
+    # miss. But only treat it that way when the extraction is healthy: a low
+    # extraction score means IDP failed outright (not scoping), so it must
+    # still be penalized normally. This single flag drives both the reframed
+    # MuleSoft-only messages and the confidence down-weight.
+    extraction_score = float(
+        (extraction.get("field_scores") or {}).get("overall_composite") or 0.0
+    )
+    cert_type = (
+        ai_cert.get("certificationType")
+        or (sf_review or {}).get("Certification_Type__c")
+        or ""
+    )
+    ir_scoped = (
+        str(cert_type).upper() == "IR"
+        and extraction_score >= _IR_HEALTHY_EXTRACTION
+    )
+
+    member_findings, member_stats = _compare_members(
+        ai_members, sf_members, ir_scoped=ir_scoped)
+    income_findings, income_stats = _compare_income(
+        ai_income, ai_calculations, sf_income, ir_scoped=ir_scoped)
+    asset_findings, asset_stats = _compare_assets(
+        ai_assets, sf_assets, ir_scoped=ir_scoped)
+    cert_findings, cert_stats = _compare_certification(ai_cert, sf_review)
     idp_findings = _idp_internal_findings(extraction)
 
-    findings = (
-        member_findings + income_findings + asset_findings + idp_findings
+    comparison_findings = (
+        member_findings + income_findings + asset_findings + cert_findings
     )
+    findings = comparison_findings + idp_findings
     confidence = _calculate_confidence(
-        extraction, member_stats, income_stats, asset_stats,
+        extraction, member_stats, income_stats, asset_stats, cert_stats,
+        comparison_findings, ir_scoped=ir_scoped,
     )
 
     return ComparisonResult(findings=findings, confidence=confidence)

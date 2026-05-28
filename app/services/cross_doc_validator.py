@@ -55,7 +55,12 @@ def validate_income_consistency(
         outliers: list[tuple[str, float, list[tuple[str, float]]]] = []
         for method, val in sorted_items:
             others = [(m, v) for m, v in sorted_items if m != method]
-            if not others:
+            # An outlier deviates from a CONSENSUS — it needs at least 2 other
+            # methods to stand apart from. With only one other method (e.g.
+            # ytd-based vs voi-based) both would qualify as each other's
+            # outlier, producing two mirror-image findings for one disagreement.
+            # That case falls through to the single summary finding below.
+            if len(others) < 2:
                 continue
             diffs = [
                 abs(val - v) / max(val, v) if max(val, v) > 0 else 0
@@ -64,7 +69,9 @@ def validate_income_consistency(
             if all(d > _DISCREPANCY_THRESHOLD for d in diffs):
                 outliers.append((method, val, others))
 
-        if outliers:
+        # If every method is an "outlier", there's no consensus to deviate
+        # from — emit the single summary finding instead of one per method.
+        if outliers and len(outliers) < len(methods):
             # Emit one finding per outlier, listing all the others it disagrees with.
             for method, val, others in outliers:
                 others_str = ", ".join(f"{m} = ${v:,.2f}" for m, v in others)
