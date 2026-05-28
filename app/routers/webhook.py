@@ -383,25 +383,57 @@ def get_case_audit(
     case_id: str,
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    """Return the audit state for a case.
+    """Return the audit state for a case, with MuleSoft data attached.
 
-    Cases in flight live in the local JobStore (transient queue).
-    Cases that finished have been written back to Salesforce and removed
-    locally — for those we fall back to reading IDP_Testing_Results__c
-    from the Case record itself, so this endpoint stays useful for both.
+    Response shape (for the monitoring UI's 3-panel detail view):
+      {
+        source: "jobstore" | "salesforce",
+        case_id, case_number, cert_type, funding_program, state, ...,
+        findings_text: str | None,         # comparison panel
+        extraction_result: dict | None,    # IDP panel
+        mulesoft_data: { ... } | None,     # MuleSoft panel
+        mulesoft_data_source: "snapshot" | "live" | null,
+        mulesoft_error: str | None,        # set if a live fetch failed
+      }
+
+    For completed cases the MuleSoft panel is served from the snapshot
+    captured at comparison time so the analyst sees exactly the data the
+    findings were computed against. For in-flight cases (no snapshot yet)
+    the panel falls back to a live Salesforce query.
     """
+    from app.services.salesforce.client import get_salesforce_client
+
     store = get_job_store(settings.audit_job_db)
     job = store.get(case_id)
+
+    # Best-effort live MuleSoft fetch. Failures don't break the panel
+    # response; they're reported in mulesoft_error and the UI degrades.
+    def _fetch_mulesoft() -> tuple[dict | None, str | None]:
+        try:
+            sf = get_salesforce_client(settings)
+            return sf.get_case_audit_data(case_id), None
+        except Exception as exc:
+            logger.warning(
+                "MuleSoft fetch failed for case %s: %s", case_id, exc,
+            )
+            return None, str(exc)
+
     if job is not None:
-        # Don't return the full extraction blob — too large.
-        job.pop("extraction_result", None)
+        snapshot = job.pop("mulesoft_snapshot", None)
+        if snapshot is not None:
+            job["mulesoft_data"] = snapshot
+            job["mulesoft_data_source"] = "snapshot"
+            job["mulesoft_error"] = None
+        else:
+            mulesoft_data, mulesoft_error = _fetch_mulesoft()
+            job["mulesoft_data"] = mulesoft_data
+            job["mulesoft_data_source"] = "live" if mulesoft_data is not None else None
+            job["mulesoft_error"] = mulesoft_error
         job["source"] = "jobstore"
         return job
 
-    # Local miss → check Salesforce. The case may have been audited and
-    # cleaned up, or may not exist at all.
+    # Local miss → check Salesforce for findings + MuleSoft data.
     try:
-        from app.services.salesforce.client import get_salesforce_client
         sf = get_salesforce_client(settings)
         record = sf.get_case_findings(case_id)
     except Exception as exc:
@@ -417,6 +449,8 @@ def get_case_audit(
             detail=f"Case {case_id} not found in JobStore or Salesforce",
         )
 
+    mulesoft_data, mulesoft_error = _fetch_mulesoft()
+
     return {
         "source": "salesforce",
         "case_id": record.get("Id"),
@@ -425,6 +459,10 @@ def get_case_audit(
         "funding_program": record.get("Funding_Program2__c"),
         "audit_complete": bool(record.get("IDP_Audit_Complete__c")),
         "findings_text": record.get("IDP_Testing_Results__c"),
+        "extraction_result": None,
+        "mulesoft_data": mulesoft_data,
+        "mulesoft_data_source": "live" if mulesoft_data is not None else None,
+        "mulesoft_error": mulesoft_error,
     }
 
 

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS audit_jobs (
     content_document_id TEXT,
     extraction_result TEXT,        -- JSON
     findings_text TEXT,
+    mulesoft_snapshot TEXT,        -- JSON snapshot captured at comparison time
     error TEXT,
     confidence REAL,
     created_at REAL NOT NULL,
@@ -80,6 +81,11 @@ class JobStore:
                     "ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
                 )
                 logger.info("Added retry_count column to existing audit_jobs table")
+            if "mulesoft_snapshot" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE audit_jobs ADD COLUMN mulesoft_snapshot TEXT"
+                )
+                logger.info("Added mulesoft_snapshot column to existing audit_jobs table")
         logger.info("Audit job store ready at %s", db_path)
 
     @contextmanager
@@ -212,15 +218,27 @@ class JobStore:
         case_id: str,
         findings_text: str,
         confidence: float,
+        mulesoft_snapshot: dict[str, Any] | None = None,
     ) -> None:
+        """Mark a case done and persist the MuleSoft data used for the
+        comparison. The snapshot lets the dashboard render exactly what
+        the analyst's findings were computed against, even if Salesforce
+        changes later.
+        """
         with self._lock, self._connect() as conn:
             now = time.time()
+            snapshot_json = (
+                json.dumps(mulesoft_snapshot, default=str)
+                if mulesoft_snapshot is not None
+                else None
+            )
             conn.execute("""
                 UPDATE audit_jobs
                 SET state = ?, findings_text = ?, confidence = ?,
+                    mulesoft_snapshot = ?,
                     completed_at = ?, updated_at = ?
                 WHERE case_id = ?
-            """, (DONE, findings_text, confidence, now, now, case_id))
+            """, (DONE, findings_text, confidence, snapshot_json, now, now, case_id))
 
     def mark_comparison_failed(self, case_id: str, error: str) -> None:
         self._set_state(case_id, COMPARISON_FAILED, error=error)
@@ -245,11 +263,12 @@ class JobStore:
             if not row:
                 return None
             data = dict(row)
-            if data.get("extraction_result"):
-                try:
-                    data["extraction_result"] = json.loads(data["extraction_result"])
-                except json.JSONDecodeError:
-                    pass
+            for json_field in ("extraction_result", "mulesoft_snapshot"):
+                if data.get(json_field):
+                    try:
+                        data[json_field] = json.loads(data[json_field])
+                    except json.JSONDecodeError:
+                        pass
             return data
 
     def list_by_state(self, state: str) -> list[dict[str, Any]]:

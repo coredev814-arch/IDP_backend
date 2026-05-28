@@ -111,32 +111,25 @@ def _finalize_case(
     settings: Settings,
     text_for_salesforce: str,
 ) -> None:
-    """Write outcome to Salesforce, then drop the local JobStore row.
+    """Write outcome to Salesforce. Local JobStore row is left intact so the
+    dashboard can render the full audit history (findings + AI extraction +
+    MuleSoft snapshot) without re-querying Salesforce per case.
 
-    Used by both success and failure paths — JobStore is a transient queue
-    only; Salesforce is the canonical archive.
-
-    If Salesforce write fails, we leave the local row in place so the
-    operator can investigate via GET /audit/cases/{case_id}. The next poll
-    cycle won't reprocess (the row is in a non-restartable state).
+    Used by both success and failure paths. Manual cleanup of completed rows
+    is available via POST /admin/audit-jobs/reset {"mode":"done"}.
     """
-    store = _store(settings)
     try:
         sf = get_salesforce_client(settings)
         sf.update_case_findings(case_id, text_for_salesforce)
     except Exception:
         logger.exception(
-            "Salesforce writeback failed for case %s — local JobStore row "
-            "kept for inspection (state remains terminal, no auto-retry)",
+            "Salesforce writeback failed for case %s — local row kept in "
+            "terminal state for inspection (no auto-retry)",
             case_id,
         )
         return
 
-    deleted = store.delete_by_case_ids([case_id])
-    logger.info(
-        "Cleaned up JobStore for case=%s (deleted %d row)",
-        case_number, deleted,
-    )
+    logger.info("Salesforce writeback complete for case=%s", case_number)
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +300,8 @@ def run_extraction(case_id: str) -> None:
             )
             return
 
-        # Permanent failure — write marker + flip flag so case drops out
-        # of the queue. JobStore is a transient queue, not an archive.
+        # Permanent failure — write marker + flip flag. Local row remains
+        # in EXTRACTION_FAILED state so the dashboard can surface it.
         _finalize_case(
             case_id, case_number, settings,
             text_for_salesforce=_format_failure_marker(
@@ -431,6 +424,7 @@ def run_comparison(case_id: str) -> None:
             case_id,
             findings_text=findings_text,
             confidence=comparison.confidence.case_confidence,
+            mulesoft_snapshot=sf_data,
         )
 
         logger.info(
@@ -449,9 +443,9 @@ def run_comparison(case_id: str) -> None:
             case_number, "=" * 60, findings_text, "=" * 60,
         )
 
-        # Push findings to Salesforce, then delete the local row.
-        # JobStore = transient queue; Salesforce = canonical archive.
-        # _finalize_case logs and bails out cleanly if Salesforce write fails.
+        # Push findings to Salesforce. Local row stays so the dashboard
+        # can keep rendering the AI extraction + MuleSoft snapshot for
+        # this case. _finalize_case logs and bails out if SF write fails.
         _finalize_case(
             case_id, case_number, settings,
             text_for_salesforce=findings_text,
