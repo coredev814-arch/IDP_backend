@@ -143,6 +143,25 @@ def _finalize_case(
 _WEDGE_PRONE_STATES: tuple[str, ...] = (EXTRACTING, EXTRACTED, COMPARING)
 
 
+def retention_sweep(settings: Settings) -> int:
+    """Delete terminal-state rows older than audit_retention_days.
+
+    No-op when retention is set to 0. Only touches done / *_failed /
+    mulesoft_timeout rows — in-flight states are protected.
+    """
+    days = settings.audit_retention_days
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    deleted = _store(settings).delete_terminal_older_than(cutoff)
+    if deleted:
+        logger.info(
+            "Retention sweep deleted %d terminal row(s) older than %d day(s)",
+            deleted, days,
+        )
+    return deleted
+
+
 def watchdog_sweep(settings: Settings) -> int:
     """Re-queue (or finalize as failed) jobs that have been wedged for too long.
 

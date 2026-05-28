@@ -22,7 +22,12 @@ import time
 from app.core.config import Settings
 from app.core.dependencies import get_settings
 from app.services.audit.job_store import EXTRACTED, get_job_store
-from app.services.audit.jobs import run_comparison, run_extraction, watchdog_sweep
+from app.services.audit.jobs import (
+    retention_sweep,
+    run_comparison,
+    run_extraction,
+    watchdog_sweep,
+)
 from app.services.salesforce.client import _escape_soql, get_salesforce_client
 
 logger = logging.getLogger(__name__)
@@ -267,4 +272,57 @@ def stop_poller_thread(timeout: float = 5.0) -> None:
     else:
         logger.info("Audit poller thread stopped cleanly")
     _THREAD = None
+
+
+# ---------------------------------------------------------------------------
+# Maintenance thread — retention cleanup + watchdog. Runs regardless of
+# audit_mode so pure-webhook deployments still get DB pruning and wedge
+# recovery (the poller thread only runs in poll/both modes).
+# ---------------------------------------------------------------------------
+
+_MAINT_THREAD: threading.Thread | None = None
+_MAINT_STOP: threading.Event | None = None
+
+
+def _run_maintenance_loop(stop_event: threading.Event) -> None:
+    settings = get_settings()
+    interval = settings.audit_maintenance_interval_seconds
+    logger.info(
+        "Maintenance thread started (retention=%dd, interval=%ds)",
+        settings.audit_retention_days, interval,
+    )
+    while not stop_event.is_set():
+        try:
+            retention_sweep(settings)
+            watchdog_sweep(settings)
+        except Exception:
+            logger.exception("Maintenance sweep failed — will retry next interval")
+        if stop_event.wait(interval):
+            return
+
+
+def start_maintenance_thread() -> bool:
+    """Start the maintenance thread on a daemon. Idempotent."""
+    global _MAINT_THREAD, _MAINT_STOP
+    if _MAINT_THREAD is not None and _MAINT_THREAD.is_alive():
+        logger.warning("start_maintenance_thread: already running")
+        return False
+    _MAINT_STOP = threading.Event()
+    _MAINT_THREAD = threading.Thread(
+        target=_run_maintenance_loop,
+        args=(_MAINT_STOP,),
+        name="idp-audit-maintenance",
+        daemon=True,
+    )
+    _MAINT_THREAD.start()
+    return True
+
+
+def stop_maintenance_thread(timeout: float = 5.0) -> None:
+    global _MAINT_THREAD, _MAINT_STOP
+    if _MAINT_STOP is None or _MAINT_THREAD is None:
+        return
+    _MAINT_STOP.set()
+    _MAINT_THREAD.join(timeout=timeout)
+    _MAINT_THREAD = None
     _STOP_EVENT = None

@@ -385,6 +385,27 @@ class JobStore:
             cur = conn.execute("DELETE FROM audit_jobs")
             return cur.rowcount
 
+    _TERMINAL_STATES = (
+        DONE, EXTRACTION_FAILED, COMPARISON_FAILED, MULESOFT_TIMEOUT,
+    )
+
+    def delete_terminal_older_than(self, cutoff_ts: float) -> int:
+        """Delete terminal-state rows whose updated_at is older than cutoff.
+
+        Used by the retention sweep to cap unbounded growth. Only touches
+        rows the pipeline is done with — in-flight states (pending,
+        extracting, extracted, comparing) are never deleted regardless of
+        age (the watchdog handles those).
+        """
+        placeholders = ",".join("?" * len(self._TERMINAL_STATES))
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM audit_jobs "
+                f"WHERE state IN ({placeholders}) AND updated_at < ?",
+                (*self._TERMINAL_STATES, cutoff_ts),
+            )
+            return cur.rowcount
+
     # ------------------------------------------------------------------
     # Watchdog support — detect & recover wedged rows
     # ------------------------------------------------------------------

@@ -133,3 +133,13 @@ class Settings(BaseSettings):
     # failure marker after the cap so they drop out of the queue.
     audit_watchdog_seconds: int = 1800           # 30 minutes
     audit_watchdog_max_retries: int = 5
+
+    # Retention — terminal rows (done / *_failed / mulesoft_timeout) older
+    # than this are deleted by the periodic maintenance sweep. Keeps the
+    # SQLite DB from growing unbounded while still leaving the dashboard a
+    # rolling window of recent audits to inspect. Set to 0 to disable.
+    audit_retention_days: int = 7
+    # How often the maintenance thread runs retention + watchdog (seconds).
+    # Independent of audit_mode — runs even in pure webhook deployments
+    # where the poller itself is idle.
+    audit_maintenance_interval_seconds: int = 3600   # 1 hour

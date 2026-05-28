@@ -18,12 +18,21 @@ async def lifespan(_app: FastAPI):
     # Start the audit poller as a background thread when audit_mode is
     # "poll" or "both". In "webhook" mode (default) this is a no-op —
     # the FastAPI server only listens for incoming webhooks.
-    from app.services.audit.poller import start_poller_thread, stop_poller_thread
+    #
+    # The maintenance thread (retention cleanup + watchdog) runs in every
+    # mode so pure-webhook deployments still prune old terminal rows from
+    # the JobStore and recover wedged in-flight cases.
+    from app.services.audit.poller import (
+        start_maintenance_thread, start_poller_thread,
+        stop_maintenance_thread, stop_poller_thread,
+    )
     start_poller_thread()
+    start_maintenance_thread()
     try:
         yield
     finally:
         stop_poller_thread()
+        stop_maintenance_thread()
 
 
 def create_app() -> FastAPI:
